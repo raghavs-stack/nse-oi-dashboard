@@ -1,0 +1,52 @@
+════════════════════════════════════════════════════════════════════════
+  EOD BACKTEST REPORT  (TAKEN TRADES ONLY)
+  Total signals today: 11
+  Taken: 3  |  Skipped: 8  |  Brokerage saved by skipping: ~Rs960 est.
+════════════════════════════════════════════════════════════════════════
+  Entry spot range: Rs22,391.40 – Rs22,527.80
+  Final spot: Rs22,614.50
+════════════════════════════════════════════════════════════════════════
+  Time    Sc  Bias      Trade         Type          Entry    Exit         P&L (net)  Result
+  -----------------------------------------------------------------------
+  09:47   68  BULLISH   22400 CE      Conservative  Rs138.0  Target Hit   Rs+6,860   +
+  09:47   68  BULLISH   22450 CE      Moderate      Rs 96.0  Target Hit   Rs+4,760   +
+  09:47   68  BULLISH   22500 CE      Aggressive    Rs 52.0  Target Hit   Rs+2,560   +
+  11:22   74  BEARISH   22500 PE      Conservative  Rs112.0  SL Hit       Rs-2,640   -
+  11:22   74  BEARISH   22450 PE      Moderate      Rs 78.0  SL Hit       Rs-1,940   -
+  11:22   74  BEARISH   22400 PE      Aggressive    Rs 41.0  SL Hit       Rs-1,090   -
+  13:55   61  BULLISH   22550 CE      Conservative  Rs 84.0  EOD Exit     Rs+3,110   +
+  13:55   61  BULLISH   22600 CE      Moderate      Rs 54.0  EOD Exit     Rs+1,960   +
+  13:55   61  BULLISH   22650 CE      Aggressive    Rs 28.0  EOD Exit     Rs+  880   +
+════════════════════════════════════════════════════════════════════════
+  NET GAIN: Rs+14,460  (after ~Rs40/lot brokerage per leg)
+  Win Rate: 67%  |  Wins: 6  |  Losses: 3
+────────────────────────────────────────────────────────────────────────
+  SKIPPED SIGNALS (8 total — not traded):
+  09:31  Score: 42  NEUTRAL   Score 42/100 < min 55
+  10:05  Score: 38  BEARISH   Score 38/100 < min 55
+  10:42  Score: 51  BULLISH   Score 51/100 < min 55
+  11:58  Score: 47  NEUTRAL   Score 47/100 < min 55
+  12:15  Score: 55  BULLISH   Too soon after last trade (23min < 45min gap)
+  12:48  Score: 58  BULLISH   Same bias (BULLISH) as last taken trade — wait for reversal
+  14:10  Score: 49  NEUTRAL   Score 49/100 < min 55
+  14:38  Score: 44  BEARISH   Score 44/100 < min 55
+════════════════════════════════════════════════════════════════════════
+  Note: Delta-approx model. Real fills differ. Brokerage estimated Rs40/lot.
+  Saved → NIFTY_backtest_20260228.csv
+════════════════════════════════════════════════════════════════════════
+
+SIGNAL SCORE EXPLANATION
+Each signal is rated 0-100 across 8 factors:
+
+  Factor                     Weight  Example
+  ─────────────────────────────────────────────
+  Bias unanimity (4/4 agree)   20    All PCR+OI+MaxPain+Tech agree
+  PCR extremity                15    PCR=0.72 far from neutral 1.0
+  Net OI score magnitude       15    Large volume-weighted OI pressure
+  RSI+VWAP confirmation        15    Tech signal agrees with OI bias
+  Max Pain alignment           10    Spot moving toward max pain
+  VIX zone (12-18 ideal)       10    VIX=14.5 → full 10pts
+  Time of day                  10    09:30-10:30 prime window
+  RoC confirmation              5    OI spike aligns with bias
+
+MIN_SIGNAL_SCORE = 55 (default) — only signals above this threshold are traded.

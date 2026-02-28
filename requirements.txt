@@ -1,0 +1,10 @@
+# NSE Live OI Dashboard — Python dependencies
+# Install with: pip install -r requirements.txt
+
+requests>=2.28.0        # NSE API fetching + cookie session
+pandas>=1.5.0           # DataFrame for option chain processing
+matplotlib>=3.6.0       # OI chart rendering (dark theme)
+yfinance>=0.2.0         # India VIX fetch (^INDIAVIX ticker)
+
+# Tkinter is included with Python — no pip install needed.
+# If missing on Linux: sudo apt-get install python3-tk
