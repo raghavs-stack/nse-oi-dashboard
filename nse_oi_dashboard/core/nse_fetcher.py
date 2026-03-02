@@ -146,63 +146,33 @@ def create_session() -> requests.Session:
 
 
 def _get_data(url: str) -> str:
-    """
-    Fetch a NSE API endpoint using the session's cookie jar.
-    No manual cookie dict — the session handles everything automatically.
-    Refreshes the option-chain page cookie on every attempt to keep nseappid fresh.
-    """
     for attempt in range(1, MAX_RETRIES + 1):
-        # Silently refresh option-chain page to keep cookies warm
-        with _cookie_lock:
-            try:
-                _global_session.get(
-                    "https://www.nseindia.com/option-chain",
-                    headers=_BROWSER_HEADERS, timeout=8)
-            except Exception:
-                pass
-            # Re-inject nseappid = nsit (JS-set cookie, expires quickly)
-            nsit = _global_session.cookies.get("nsit", "")
-            if nsit:
-                _global_session.cookies.set("nseappid", nsit, domain=".nseindia.com")
-
         try:
             r = _global_session.get(url, headers=NSE_HEADERS, timeout=15)
 
             if r.status_code == 200:
                 text = r.text.strip()
-                if not text:
-                    print(f"  Empty response on attempt {attempt}")
+                if not text or text.startswith("<") or text in ("{}", "null"):
+                    print(f"Invalid JSON attempt {attempt}")
                     time.sleep(4 * attempt)
                     continue
-                if text.startswith("<"):
-                    print(f"  HTML response on attempt {attempt} (Cloudflare block)")
-                    time.sleep(6 * attempt)
-                    continue
-                if text in ("{}", "null"):
-                    print(f"  Empty JSON '{text}' on attempt {attempt} "
-                          f"— nseappid cookie may have expired")
-                    # Re-warm the session and retry
-                    create_session()
-                    time.sleep(5 * attempt)
-                    continue
-                return r.text   # good JSON
+                return text
 
             elif r.status_code in (401, 403):
-                print(f"  HTTP {r.status_code} on attempt {attempt} — rebuilding session")
+                print(f"HTTP {r.status_code} — rebuilding session")
                 create_session()
-                time.sleep(8 * attempt)
+                time.sleep(6 * attempt)
+
             elif r.status_code == 429:
-                print(f"  HTTP 429 Rate Limited — sleeping 45s")
-                time.sleep(45)
+                print("Rate limited — sleeping 60s")
+                time.sleep(60)
+
             else:
-                print(f"  HTTP {r.status_code} on attempt {attempt}")
+                print(f"HTTP {r.status_code}")
                 time.sleep(4 * attempt)
 
-        except requests.Timeout:
-            print(f"  Timeout attempt {attempt}")
-            time.sleep(4 * attempt)
         except requests.RequestException as e:
-            print(f"  Network error: {e}")
+            print(f"Network error: {e}")
             time.sleep(4 * attempt)
 
     return ""
