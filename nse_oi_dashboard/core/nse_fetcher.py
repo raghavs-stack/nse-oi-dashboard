@@ -56,52 +56,159 @@ def _set_cookie(session, cookies_dict: dict):
 
 
 def create_session() -> requests.Session:
+    """
+    4-step NSE session warmup that works from Colab IPs.
+    Steps: homepage → option-chain page → set cookies → validate.
+    Longer delays than before because Colab is cloud IP (NSE is rate-limiter-happy).
+    """
     global _global_session, _global_cookies
     _global_session = requests.Session()
     _global_session.headers.update(NSE_HEADERS)
     _global_cookies = {}
     try:
-        _global_session.get("https://www.nseindia.com/", timeout=10)
-        time.sleep(1.2)
+        # Step 1: hit homepage to establish base session
+        _global_session.get("https://www.nseindia.com/", timeout=15)
+        time.sleep(2.0)
+
+        # Step 2: hit option-chain page so Referer is correct
+        _global_session.get(
+            "https://www.nseindia.com/option-chain",
+            headers={**NSE_HEADERS, "Referer": "https://www.nseindia.com/"},
+            timeout=10)
+        time.sleep(1.5)
+
+        # Step 3: grab cookies
         _set_cookie(_global_session, _global_cookies)
-        time.sleep(0.8)
-        print("NSE session ready (thread-safe cookie mode).")
+        time.sleep(1.0)
+
+        # Step 4: quick validate — try allIndices (light call, always works)
+        test = _global_session.get(
+            "https://www.nseindia.com/api/allIndices",
+            headers=NSE_HEADERS, cookies=_global_cookies, timeout=10)
+        if test.status_code == 200:
+            print("NSE session ready ✓ (4-step warmup, Colab-compatible)")
+        else:
+            print(f"NSE session warmup — validate returned HTTP {test.status_code}, continuing anyway")
     except requests.RequestException as e:
         print(f"Session warm-up issue: {e}")
     return _global_session
 
 
 def _get_data(url: str) -> str:
-    _set_cookie(_global_session, _global_cookies)
+    """
+    Fetch with cookie refresh before every attempt.
+    NSE/Cloudflare on Colab IPs rejects stale token pairs quickly,
+    so we re-set cookies on every call (not just on 401/403).
+    """
     for attempt in range(1, MAX_RETRIES + 1):
+        _set_cookie(_global_session, _global_cookies)   # always refresh
         try:
             r = _global_session.get(
                 url, headers=NSE_HEADERS,
-                cookies=_global_cookies, timeout=10)
+                cookies=_global_cookies, timeout=12)
             if r.status_code == 200:
-                return r.text
-            if r.status_code in (401, 403):
-                print(f"HTTP {r.status_code} — refreshing cookies (attempt {attempt})")
-                _set_cookie(_global_session, _global_cookies)
+                # Reject empty or HTML responses
+                text = r.text.strip()
+                if text and not text.startswith("<"):
+                    return r.text
+                if text.startswith("<"):
+                    print(f"NSE returned HTML on attempt {attempt} — refreshing session")
+                    time.sleep(4 * attempt)
+                    continue
+            elif r.status_code in (401, 403):
+                print(f"HTTP {r.status_code} on attempt {attempt} — re-warming session")
+                create_session()
+                time.sleep(5 * attempt)
+            else:
+                print(f"HTTP {r.status_code} on attempt {attempt}")
                 time.sleep(3 * attempt)
         except requests.Timeout:
             print(f"Timeout attempt {attempt}")
+            time.sleep(4 * attempt)
         except requests.RequestException as e:
             print(f"Network error: {e}")
-        time.sleep(4 * attempt)
+            time.sleep(4 * attempt)
     return ""
 
 
 def fetch_chain(session, symbol: str) -> dict | None:
-    """Fetch full option chain JSON for index symbol."""
+    """
+    Fetch option chain for symbol and normalize into a consistent structure.
+
+    NSE API has returned data in 3 different shapes over the years:
+      Shape A (most common):  {"records": {"data":[...], "expiryDates":[...], "underlyingValue":...}}
+      Shape B (some periods): {"filtered": {"data":[...], ...}, "records": {...}}
+      Shape C (rare / new):   {"data": [...], "expiryDates": [...], "underlyingValue": ...}
+
+    This function always returns Shape A regardless of which shape NSE sends,
+    so process_cycle() can safely use data["records"]["data"] everywhere.
+    """
     url  = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     text = _get_data(url)
     if not text:
         return None
-    try:
-        return json.loads(text)
-    except Exception:
+
+    # If we got HTML (session expired / redirect), bail early
+    if text.strip().startswith("<"):
+        print("NSE returned HTML (session expired) — will refresh next cycle")
         return None
+
+    try:
+        raw = json.loads(text)
+    except Exception as e:
+        print(f"JSON parse error: {e}  (first 80 chars: {text[:80]!r})")
+        return None
+
+    if not isinstance(raw, dict):
+        print(f"Unexpected response type: {type(raw)}")
+        return None
+
+    # ── Shape A: already has "records" with all fields ────────────
+    if "records" in raw and isinstance(raw["records"], dict):
+        rec = raw["records"]
+        # Validate it has the minimum we need
+        if "data" in rec and "underlyingValue" in rec:
+            return raw           # perfect — use as-is
+
+        # "records" exists but is incomplete — try to patch from "filtered"
+        if "filtered" in raw and isinstance(raw["filtered"], dict):
+            filt = raw["filtered"]
+            rec.setdefault("data",            filt.get("data", []))
+            rec.setdefault("expiryDates",     filt.get("expiryDates", []))
+            rec.setdefault("underlyingValue", filt.get("underlyingValue", 0))
+            if rec.get("data") and rec.get("underlyingValue"):
+                return raw
+
+    # ── Shape B: only "filtered" (no usable "records") ────────────
+    if "filtered" in raw and isinstance(raw["filtered"], dict):
+        filt = raw["filtered"]
+        if filt.get("data") and filt.get("underlyingValue"):
+            print("NSE Shape B: using 'filtered' block")
+            return {"records": {
+                "data":            filt["data"],
+                "expiryDates":     filt.get("expiryDates", []),
+                "underlyingValue": filt["underlyingValue"],
+                "timestamp":       filt.get("timestamp", ""),
+            }}
+
+    # ── Shape C: flat structure at root level ─────────────────────
+    if "data" in raw and "underlyingValue" in raw:
+        print("NSE Shape C: flat root structure")
+        return {"records": {
+            "data":            raw["data"],
+            "expiryDates":     raw.get("expiryDates", []),
+            "underlyingValue": raw["underlyingValue"],
+            "timestamp":       raw.get("timestamp", ""),
+        }}
+
+    # ── Unknown shape — print keys to help debug ──────────────────
+    print(f"NSE unknown response shape. Top-level keys: {list(raw.keys())}")
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            print(f"  '{k}' sub-keys: {list(v.keys())[:10]}")
+        elif isinstance(v, list):
+            print(f"  '{k}' list len={len(v)}")
+    return None
 
 
 def fetch_vix() -> str:

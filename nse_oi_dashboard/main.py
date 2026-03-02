@@ -59,13 +59,31 @@ def process_cycle(data: dict, symbol: str, vix: str,
                   demo: bool, cycle: int,
                   selected_expiry: str = None) -> Signal | None:
 
-    rec    = data["records"]
-    spot   = rec["underlyingValue"]
+    # Validate response structure before touching any key
+    if not isinstance(data, dict) or "records" not in data:
+        print(f"process_cycle: bad data shape — keys={list(data.keys()) if isinstance(data,dict) else type(data)}")
+        return None
+
+    rec = data["records"]
+    if not isinstance(rec, dict):
+        print(f"process_cycle: 'records' is not a dict (type={type(rec)})")
+        return None
+
+    spot = rec.get("underlyingValue")
+    if not spot:
+        print(f"process_cycle: missing underlyingValue — rec keys={list(rec.keys())}")
+        return None
+    spot = float(spot)
     avail  = rec.get("expiryDates", [])
     expiry = (selected_expiry if selected_expiry and selected_expiry in avail
               else avail[0] if avail else "")
 
-    df = build_df(rec["data"], expiry)
+    raw_data = rec.get("data", [])
+    if not raw_data:
+        print("process_cycle: empty data list in records")
+        return None
+
+    df = build_df(raw_data, expiry)
     if df.empty:
         return None
 
@@ -93,7 +111,7 @@ def process_cycle(data: dict, symbol: str, vix: str,
     max_pain = calc_max_pain(df)
 
     # ── RoC alerts ─────────────────────────────────────────────
-    roc_alerts = compute_roc_alerts(rec["data"], expiry)
+    roc_alerts = compute_roc_alerts(raw_data, expiry)
 
     # ── IV analytics (v5.3 NEW) ────────────────────────────────
     atm_iv      = calc_atm_iv(df, spot)
@@ -138,7 +156,7 @@ def process_cycle(data: dict, symbol: str, vix: str,
 
     # ── CSV log ────────────────────────────────────────────────
     log_row = pd.DataFrame([{
-        "Timestamp":    rec["timestamp"], "Spot": spot, "VIX": vix,
+        "Timestamp":    rec.get("timestamp", now_ist().strftime("%d-%b-%Y %H:%M:%S")), "Spot": spot, "VIX": vix,
         "PCR_Full": pcr, "PCR_Local": local_pcr, "PCR_Signal": pcr_signal,
         "MaxPain": max_pain, "Resistance": resistance, "Support": support,
         "WeightedScore": weighted_net_score, "RawOIScore": raw_net_score,
