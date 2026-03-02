@@ -107,16 +107,18 @@ def create_session() -> requests.Session:
            referer="https://www.nseindia.com/market-data/live-equity-market",
            delay=2.5, label="option-chain")
 
-    # Step 3: marketStatus API warms the API token
-    try:
-        r = _global_session.get(
-            "https://www.nseindia.com/api/marketStatus",
-            headers=NSE_HEADERS, timeout=12)
-        time.sleep(1.0)
-    except Exception:
-        pass
+    # ── KEY FIX: nseappid is set by JavaScript (requests can't run JS).
+    # NSE's JS sets nseappid = nsit value. Set it manually in the jar.
+    nsit = _global_session.cookies.get("nsit", "")
+    if nsit:
+        _global_session.cookies.set("nseappid", nsit, domain=".nseindia.com")
+        print(f"  nseappid set manually from nsit ✓  (nsit={nsit[:12]}…)")
+    else:
+        print("  ⚠ nsit missing — nseappid cannot be set. Option chain may fail.")
 
-    # Step 4: validate with allIndices
+    time.sleep(1.0)
+
+    # Final validate
     try:
         r = _global_session.get(
             "https://www.nseindia.com/api/allIndices",
@@ -150,7 +152,7 @@ def _get_data(url: str) -> str:
     Refreshes the option-chain page cookie on every attempt to keep nseappid fresh.
     """
     for attempt in range(1, MAX_RETRIES + 1):
-        # Silently refresh nseappid cookie before each API call
+        # Silently refresh option-chain page to keep cookies warm
         with _cookie_lock:
             try:
                 _global_session.get(
@@ -158,6 +160,10 @@ def _get_data(url: str) -> str:
                     headers=_BROWSER_HEADERS, timeout=8)
             except Exception:
                 pass
+            # Re-inject nseappid = nsit (JS-set cookie, expires quickly)
+            nsit = _global_session.cookies.get("nsit", "")
+            if nsit:
+                _global_session.cookies.set("nseappid", nsit, domain=".nseindia.com")
 
         try:
             r = _global_session.get(url, headers=NSE_HEADERS, timeout=15)
