@@ -263,8 +263,9 @@ def main():
             else:
                 vix  = fetch_vix()
                 data = fetch_chain(session, SYMBOL)
-                if data is None:
-                    print(f"No data. Next open: {next_open_str()}. Retrying in {REFRESH_RATE}s...")
+                if not data:   # catches None AND {} (Cloudflare empty block)
+                    print(f"No data (NSE returned {type(data).__name__}). "
+                          f"Next open: {next_open_str()}. Retrying in {REFRESH_RATE}s...")
                     if not is_market_open():
                         print("Switching to Demo Mode...")
                         use_demo = True

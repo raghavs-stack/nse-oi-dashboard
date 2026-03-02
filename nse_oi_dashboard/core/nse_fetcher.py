@@ -1,8 +1,11 @@
 # ════════════════════════════════════════════════════════════════
-#  core/nse_fetcher.py
+#  core/nse_fetcher.py  v5.3.2
 #  Thread-safe NSE session + option chain parser.
 #  Cookie pattern ported from haripm2211/nse/nse_data.py.
 #  build_df() now captures IV columns (v5.3) for iv_analytics.
+#
+#  SENTINEL — DO NOT REMOVE (used by colab_runner.py to detect stale files)
+NSE_FETCHER_VERSION = "5.3.2"
 # ════════════════════════════════════════════════════════════════
 
 import json, math, random, threading, time
@@ -57,68 +60,90 @@ def _set_cookie(session, cookies_dict: dict):
 
 def create_session() -> requests.Session:
     """
-    4-step NSE session warmup that works from Colab IPs.
-    Steps: homepage → option-chain page → set cookies → validate.
-    Longer delays than before because Colab is cloud IP (NSE is rate-limiter-happy).
+    Colab-compatible NSE session warmup.
+
+    Cloudflare requires a realistic browser navigation sequence:
+      1. Hit homepage (establishes initial CF cookie)
+      2. Sleep — simulate human reading time
+      3. Navigate to option-chain page (sets __cfduid + nsit + nseappid)
+      4. Hit market-status (warms API token)
+      5. Validate with allIndices call
+
+    Colab cloud IPs are flagged by Cloudflare; longer delays help.
+    Session cookies expire every ~5 minutes on NSE — rebuild every 10 cycles.
     """
     global _global_session, _global_cookies
     _global_session = requests.Session()
     _global_session.headers.update(NSE_HEADERS)
     _global_cookies = {}
+
+    steps = [
+        ("https://www.nseindia.com/",                              2.5, "homepage"),
+        ("https://www.nseindia.com/market-data/live-equity-market", 1.5, "market page"),
+        ("https://www.nseindia.com/option-chain",                   2.0, "option-chain"),
+        ("https://www.nseindia.com/api/marketStatus",               1.0, "marketStatus"),
+    ]
+
+    for url, delay, label in steps:
+        try:
+            r = _global_session.get(url, headers=NSE_HEADERS, timeout=15)
+            _global_cookies.update(r.cookies)
+            time.sleep(delay)
+        except requests.RequestException as e:
+            print(f"  Warmup step '{label}' failed: {e}")
+
+    # Final validate
     try:
-        # Step 1: hit homepage to establish base session
-        _global_session.get("https://www.nseindia.com/", timeout=15)
-        time.sleep(2.0)
-
-        # Step 2: hit option-chain page so Referer is correct
-        _global_session.get(
-            "https://www.nseindia.com/option-chain",
-            headers={**NSE_HEADERS, "Referer": "https://www.nseindia.com/"},
-            timeout=10)
-        time.sleep(1.5)
-
-        # Step 3: grab cookies
-        _set_cookie(_global_session, _global_cookies)
-        time.sleep(1.0)
-
-        # Step 4: quick validate — try allIndices (light call, always works)
-        test = _global_session.get(
+        r = _global_session.get(
             "https://www.nseindia.com/api/allIndices",
-            headers=NSE_HEADERS, cookies=_global_cookies, timeout=10)
-        if test.status_code == 200:
-            print("NSE session ready ✓ (4-step warmup, Colab-compatible)")
+            headers=NSE_HEADERS, cookies=_global_cookies, timeout=12)
+        _global_cookies.update(r.cookies)
+        if r.status_code == 200 and r.text.strip().startswith("{"):
+            import json as _j
+            rd = _j.loads(r.text)
+            spots = [x["last"] for x in rd.get("data",[]) if x.get("index") in ("NIFTY 50","NIFTY BANK")]
+            spot_str = "  ".join(f"{x:,.0f}" for x in spots) if spots else "OK"
+            print(f"NSE session ready ✓  Spots: {spot_str}")
         else:
-            print(f"NSE session warmup — validate returned HTTP {test.status_code}, continuing anyway")
-    except requests.RequestException as e:
-        print(f"Session warm-up issue: {e}")
+            print(f"NSE session warmup done (validate HTTP {r.status_code}) — proceeding")
+    except Exception as e:
+        print(f"NSE session warmup complete (validate skipped: {e})")
+
     return _global_session
 
 
 def _get_data(url: str) -> str:
     """
     Fetch with cookie refresh before every attempt.
-    NSE/Cloudflare on Colab IPs rejects stale token pairs quickly,
-    so we re-set cookies on every call (not just on 401/403).
+    NSE/Cloudflare on Colab IPs invalidates tokens quickly —
+    we refresh cookies before each call AND absorb any new cookies from responses.
     """
     for attempt in range(1, MAX_RETRIES + 1):
-        _set_cookie(_global_session, _global_cookies)   # always refresh
+        _set_cookie(_global_session, _global_cookies)   # always refresh first
         try:
             r = _global_session.get(
                 url, headers=NSE_HEADERS,
                 cookies=_global_cookies, timeout=12)
+            _global_cookies.update(r.cookies)           # absorb any new tokens
+
             if r.status_code == 200:
-                # Reject empty or HTML responses
                 text = r.text.strip()
                 if text and not text.startswith("<"):
                     return r.text
                 if text.startswith("<"):
-                    print(f"NSE returned HTML on attempt {attempt} — refreshing session")
-                    time.sleep(4 * attempt)
+                    print(f"NSE returned HTML on attempt {attempt} — Cloudflare block")
+                    time.sleep(5 * attempt)
                     continue
+                # Empty body
+                print(f"NSE returned empty body on attempt {attempt}")
+                time.sleep(4 * attempt)
             elif r.status_code in (401, 403):
-                print(f"HTTP {r.status_code} on attempt {attempt} — re-warming session")
+                print(f"HTTP {r.status_code} on attempt {attempt} — rebuilding session")
                 create_session()
-                time.sleep(5 * attempt)
+                time.sleep(6 * attempt)
+            elif r.status_code == 429:
+                print(f"HTTP 429 Rate Limited on attempt {attempt} — sleeping 30s")
+                time.sleep(30)
             else:
                 print(f"HTTP {r.status_code} on attempt {attempt}")
                 time.sleep(3 * attempt)
@@ -142,25 +167,32 @@ def fetch_chain(session, symbol: str) -> dict | None:
 
     This function always returns Shape A regardless of which shape NSE sends,
     so process_cycle() can safely use data["records"]["data"] everywhere.
+    Returns None on ANY failure so callers can use `if not data`.
     """
     url  = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     text = _get_data(url)
     if not text:
         return None
 
-    # If we got HTML (session expired / redirect), bail early
-    if text.strip().startswith("<"):
-        print("NSE returned HTML (session expired) — will refresh next cycle")
+    # If we got HTML (session expired / Cloudflare redirect), bail early
+    stripped = text.strip()
+    if stripped.startswith("<"):
+        print("NSE returned HTML — Cloudflare blocked or session expired. Rebuilding session...")
+        create_session()
         return None
 
     try:
         raw = json.loads(text)
     except Exception as e:
-        print(f"JSON parse error: {e}  (first 80 chars: {text[:80]!r})")
+        print(f"JSON parse error: {e}  (response[:100]: {text[:100]!r})")
         return None
 
-    if not isinstance(raw, dict):
-        print(f"Unexpected response type: {type(raw)}")
+    # {} or non-dict = Cloudflare rate-limit or error response
+    if not isinstance(raw, dict) or not raw:
+        print(f"NSE returned empty/non-dict response ({type(raw).__name__}). "
+              f"Cloudflare block likely. Rebuilding session in 10s...")
+        time.sleep(10)
+        create_session()
         return None
 
     # ── Shape A: already has "records" with all fields ────────────
