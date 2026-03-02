@@ -30,6 +30,18 @@ def strike_step(symbol: str) -> int:
 
 
 # ── NSE session ───────────────────────────────────────────────────
+# Two separate header sets — browser headers for page visits,
+# API headers for JSON endpoints (different Accept header matters)
+_BROWSER_HEADERS = {
+    "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 NSE_HEADERS = {
     "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -39,145 +51,171 @@ NSE_HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Connection":      "keep-alive",
     "Referer":         "https://www.nseindia.com/option-chain",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
-_global_session = requests.Session()
-_global_cookies: dict = {}
-_cookie_lock    = threading.Lock()
+_global_session: requests.Session = requests.Session()
+_cookie_lock = threading.Lock()
 
 
-def _set_cookie(session, cookies_dict: dict):
-    """Thread-safe cookie refresh (haripm2211 pattern)."""
-    with _cookie_lock:
-        try:
-            r = session.get(
-                "https://www.nseindia.com/option-chain",
-                headers=NSE_HEADERS, timeout=8)
-            cookies_dict.update(r.cookies)
-        except requests.RequestException:
-            pass
+def _visit(url: str, referer: str = "https://www.nseindia.com/", delay: float = 2.0, label: str = ""):
+    """Hit a browser URL to accumulate cookies in the session jar."""
+    hdrs = {**_BROWSER_HEADERS, "Referer": referer}
+    try:
+        r = _global_session.get(url, headers=hdrs, timeout=15)
+        if label:
+            ck = list(r.cookies.keys())
+            all_ck = list(_global_session.cookies.keys())
+            print(f"  [{label}] HTTP {r.status_code}  new={ck}  jar={all_ck}")
+        time.sleep(delay)
+        return r
+    except requests.RequestException as e:
+        print(f"  [{label}] failed: {e}")
+        return None
 
 
 def create_session() -> requests.Session:
     """
-    Colab-compatible NSE session warmup.
+    NSE session warmup that reliably gets nseappid + nsit + Akamai cookies.
 
-    Cloudflare requires a realistic browser navigation sequence:
-      1. Hit homepage (establishes initial CF cookie)
-      2. Sleep — simulate human reading time
-      3. Navigate to option-chain page (sets __cfduid + nsit + nseappid)
-      4. Hit market-status (warms API token)
-      5. Validate with allIndices call
+    Key insight from diagnosis:
+    - Homepage returns 403 from Colab IPs → skip it
+    - Market data page gives: nsit, _abck, bm_sz  (Akamai cookies)
+    - Option-chain page gives: nseappid  (required for API calls)
+    - Order matters: option-chain MUST be hit on a session that already has
+      Akamai cookies, otherwise nseappid is not set
 
-    Colab cloud IPs are flagged by Cloudflare; longer delays help.
-    Session cookies expire every ~5 minutes on NSE — rebuild every 10 cycles.
+    Correct sequence:
+      1. market-data page  → nsit + Akamai tokens
+      2. option-chain page → nseappid
+      3. marketStatus API  → validates session
+      4. allIndices API    → confirms spots are reachable
     """
-    global _global_session, _global_cookies
-    _global_session = requests.Session()
-    _global_session.headers.update(NSE_HEADERS)
-    _global_cookies = {}
+    global _global_session
+    with _cookie_lock:
+        _global_session = requests.Session()
+        _global_session.headers.update(_BROWSER_HEADERS)
 
-    steps = [
-        ("https://www.nseindia.com/",                              2.5, "homepage"),
-        ("https://www.nseindia.com/market-data/live-equity-market", 1.5, "market page"),
-        ("https://www.nseindia.com/option-chain",                   2.0, "option-chain"),
-        ("https://www.nseindia.com/api/marketStatus",               1.0, "marketStatus"),
-    ]
+    print("  Warming up NSE session...")
 
-    for url, delay, label in steps:
-        try:
-            r = _global_session.get(url, headers=NSE_HEADERS, timeout=15)
-            _global_cookies.update(r.cookies)
-            time.sleep(delay)
-        except requests.RequestException as e:
-            print(f"  Warmup step '{label}' failed: {e}")
+    # Step 1: market data page → nsit, _abck, bm_sz
+    _visit("https://www.nseindia.com/market-data/live-equity-market",
+           referer="https://www.google.com/", delay=2.5, label="market-data")
 
-    # Final validate
+    # Step 2: option-chain page → nseappid  (must come AFTER Akamai cookies)
+    _visit("https://www.nseindia.com/option-chain",
+           referer="https://www.nseindia.com/market-data/live-equity-market",
+           delay=2.5, label="option-chain")
+
+    # Step 3: marketStatus API warms the API token
+    try:
+        r = _global_session.get(
+            "https://www.nseindia.com/api/marketStatus",
+            headers=NSE_HEADERS, timeout=12)
+        time.sleep(1.0)
+    except Exception:
+        pass
+
+    # Step 4: validate with allIndices
     try:
         r = _global_session.get(
             "https://www.nseindia.com/api/allIndices",
-            headers=NSE_HEADERS, cookies=_global_cookies, timeout=12)
-        _global_cookies.update(r.cookies)
+            headers=NSE_HEADERS, timeout=12)
         if r.status_code == 200 and r.text.strip().startswith("{"):
-            import json as _j
-            rd = _j.loads(r.text)
-            spots = [x["last"] for x in rd.get("data",[]) if x.get("index") in ("NIFTY 50","NIFTY BANK")]
-            spot_str = "  ".join(f"{x:,.0f}" for x in spots) if spots else "OK"
-            print(f"NSE session ready ✓  Spots: {spot_str}")
+            d = json.loads(r.text)
+            spots = [(x["index"], x["last"]) for x in d.get("data", [])
+                     if x.get("index") in ("NIFTY 50", "NIFTY BANK")]
+            spot_str = "  ".join(f"{s[0]}={s[1]:,.0f}" for s in spots) if spots else "OK"
+            jar_keys = list(_global_session.cookies.keys())
+            has_nseappid = "nseappid" in jar_keys
+            print(f"  NSE session ready ✓  {spot_str}")
+            print(f"  Cookies: {jar_keys}  |  nseappid={'✓' if has_nseappid else '✗ MISSING'}")
+            if not has_nseappid:
+                print("  ⚠ nseappid missing — option chain may return {}. "
+                      "Retrying warmup in 5s...")
+                time.sleep(5)
+                return create_session()   # one automatic retry
         else:
-            print(f"NSE session warmup done (validate HTTP {r.status_code}) — proceeding")
+            print(f"  NSE warmup: allIndices HTTP {r.status_code} — proceeding anyway")
     except Exception as e:
-        print(f"NSE session warmup complete (validate skipped: {e})")
+        print(f"  NSE warmup: validate skipped ({e})")
 
     return _global_session
 
 
 def _get_data(url: str) -> str:
     """
-    Fetch with cookie refresh before every attempt.
-    NSE/Cloudflare on Colab IPs invalidates tokens quickly —
-    we refresh cookies before each call AND absorb any new cookies from responses.
+    Fetch a NSE API endpoint using the session's cookie jar.
+    No manual cookie dict — the session handles everything automatically.
+    Refreshes the option-chain page cookie on every attempt to keep nseappid fresh.
     """
     for attempt in range(1, MAX_RETRIES + 1):
-        _set_cookie(_global_session, _global_cookies)   # always refresh first
+        # Silently refresh nseappid cookie before each API call
+        with _cookie_lock:
+            try:
+                _global_session.get(
+                    "https://www.nseindia.com/option-chain",
+                    headers=_BROWSER_HEADERS, timeout=8)
+            except Exception:
+                pass
+
         try:
-            r = _global_session.get(
-                url, headers=NSE_HEADERS,
-                cookies=_global_cookies, timeout=12)
-            _global_cookies.update(r.cookies)           # absorb any new tokens
+            r = _global_session.get(url, headers=NSE_HEADERS, timeout=15)
 
             if r.status_code == 200:
                 text = r.text.strip()
-                if text and not text.startswith("<"):
-                    return r.text
+                if not text:
+                    print(f"  Empty response on attempt {attempt}")
+                    time.sleep(4 * attempt)
+                    continue
                 if text.startswith("<"):
-                    print(f"NSE returned HTML on attempt {attempt} — Cloudflare block")
+                    print(f"  HTML response on attempt {attempt} (Cloudflare block)")
+                    time.sleep(6 * attempt)
+                    continue
+                if text in ("{}", "null"):
+                    print(f"  Empty JSON '{text}' on attempt {attempt} "
+                          f"— nseappid cookie may have expired")
+                    # Re-warm the session and retry
+                    create_session()
                     time.sleep(5 * attempt)
                     continue
-                # Empty body
-                print(f"NSE returned empty body on attempt {attempt}")
-                time.sleep(4 * attempt)
+                return r.text   # good JSON
+
             elif r.status_code in (401, 403):
-                print(f"HTTP {r.status_code} on attempt {attempt} — rebuilding session")
+                print(f"  HTTP {r.status_code} on attempt {attempt} — rebuilding session")
                 create_session()
-                time.sleep(6 * attempt)
+                time.sleep(8 * attempt)
             elif r.status_code == 429:
-                print(f"HTTP 429 Rate Limited on attempt {attempt} — sleeping 30s")
-                time.sleep(30)
+                print(f"  HTTP 429 Rate Limited — sleeping 45s")
+                time.sleep(45)
             else:
-                print(f"HTTP {r.status_code} on attempt {attempt}")
-                time.sleep(3 * attempt)
+                print(f"  HTTP {r.status_code} on attempt {attempt}")
+                time.sleep(4 * attempt)
+
         except requests.Timeout:
-            print(f"Timeout attempt {attempt}")
+            print(f"  Timeout attempt {attempt}")
             time.sleep(4 * attempt)
         except requests.RequestException as e:
-            print(f"Network error: {e}")
+            print(f"  Network error: {e}")
             time.sleep(4 * attempt)
+
     return ""
 
 
 def fetch_chain(session, symbol: str) -> dict | None:
     """
     Fetch option chain for symbol and normalize into a consistent structure.
-
-    NSE API has returned data in 3 different shapes over the years:
-      Shape A (most common):  {"records": {"data":[...], "expiryDates":[...], "underlyingValue":...}}
-      Shape B (some periods): {"filtered": {"data":[...], ...}, "records": {...}}
-      Shape C (rare / new):   {"data": [...], "expiryDates": [...], "underlyingValue": ...}
-
-    This function always returns Shape A regardless of which shape NSE sends,
-    so process_cycle() can safely use data["records"]["data"] everywhere.
-    Returns None on ANY failure so callers can use `if not data`.
+    Uses session cookie jar (no manual cookie dict needed).
+    Returns None on any failure — callers use `if not data`.
     """
     url  = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     text = _get_data(url)
     if not text:
         return None
 
-    # If we got HTML (session expired / Cloudflare redirect), bail early
     stripped = text.strip()
     if stripped.startswith("<"):
-        print("NSE returned HTML — Cloudflare blocked or session expired. Rebuilding session...")
+        print("NSE returned HTML — session needs rebuild")
         create_session()
         return None
 
@@ -187,22 +225,16 @@ def fetch_chain(session, symbol: str) -> dict | None:
         print(f"JSON parse error: {e}  (response[:100]: {text[:100]!r})")
         return None
 
-    # {} or non-dict = Cloudflare rate-limit or error response
     if not isinstance(raw, dict) or not raw:
-        print(f"NSE returned empty/non-dict response ({type(raw).__name__}). "
-              f"Cloudflare block likely. Rebuilding session in 10s...")
-        time.sleep(10)
-        create_session()
+        print(f"NSE returned empty/bad response — Cloudflare block likely")
         return None
 
-    # ── Shape A: already has "records" with all fields ────────────
+    # Shape A: {"records": {"data": [...], "underlyingValue": ...}}
     if "records" in raw and isinstance(raw["records"], dict):
         rec = raw["records"]
-        # Validate it has the minimum we need
         if "data" in rec and "underlyingValue" in rec:
-            return raw           # perfect — use as-is
-
-        # "records" exists but is incomplete — try to patch from "filtered"
+            return raw
+        # Patch from "filtered" if records is incomplete
         if "filtered" in raw and isinstance(raw["filtered"], dict):
             filt = raw["filtered"]
             rec.setdefault("data",            filt.get("data", []))
@@ -211,11 +243,10 @@ def fetch_chain(session, symbol: str) -> dict | None:
             if rec.get("data") and rec.get("underlyingValue"):
                 return raw
 
-    # ── Shape B: only "filtered" (no usable "records") ────────────
+    # Shape B: {"filtered": {"data": [...], "underlyingValue": ...}}
     if "filtered" in raw and isinstance(raw["filtered"], dict):
         filt = raw["filtered"]
         if filt.get("data") and filt.get("underlyingValue"):
-            print("NSE Shape B: using 'filtered' block")
             return {"records": {
                 "data":            filt["data"],
                 "expiryDates":     filt.get("expiryDates", []),
@@ -223,9 +254,8 @@ def fetch_chain(session, symbol: str) -> dict | None:
                 "timestamp":       filt.get("timestamp", ""),
             }}
 
-    # ── Shape C: flat structure at root level ─────────────────────
+    # Shape C: {"data": [...], "underlyingValue": ...}
     if "data" in raw and "underlyingValue" in raw:
-        print("NSE Shape C: flat root structure")
         return {"records": {
             "data":            raw["data"],
             "expiryDates":     raw.get("expiryDates", []),
@@ -233,13 +263,7 @@ def fetch_chain(session, symbol: str) -> dict | None:
             "timestamp":       raw.get("timestamp", ""),
         }}
 
-    # ── Unknown shape — print keys to help debug ──────────────────
-    print(f"NSE unknown response shape. Top-level keys: {list(raw.keys())}")
-    for k, v in raw.items():
-        if isinstance(v, dict):
-            print(f"  '{k}' sub-keys: {list(v.keys())[:10]}")
-        elif isinstance(v, list):
-            print(f"  '{k}' list len={len(v)}")
+    print(f"NSE unknown response. Keys: {list(raw.keys())}")
     return None
 
 
@@ -285,12 +309,24 @@ def build_df(data_items: list, expiry: str) -> pd.DataFrame:
 
 # ── Dual-index fetcher (haripm2211 fetch_oi_data_for_ui port) ────
 def _get_highest_oi_strikes(num: int, step: int, nearest: int, url: str):
+    """Uses fetch_chain normalization so shape A/B/C are all handled."""
+    # Reuse fetch_chain's normalization by calling _get_data + manual parse
     text = _get_data(url)
     if not text:
         return [], 0, 0, ""
     try:
-        data = json.loads(text)
-        expiry_dates = data["records"].get("expiryDates", [])
+        raw = json.loads(text)
+        # Normalize using same logic as fetch_chain
+        if "records" in raw and "data" in raw["records"]:
+            rec = raw["records"]
+        elif "filtered" in raw and raw["filtered"].get("data"):
+            rec = raw["filtered"]
+        elif "data" in raw and "underlyingValue" in raw:
+            rec = raw
+        else:
+            return [], 0, 0, ""
+
+        expiry_dates = rec.get("expiryDates", [])
         if not expiry_dates:
             return [], 0, 0, ""
         curr_expiry  = expiry_dates[0]
@@ -301,7 +337,7 @@ def _get_highest_oi_strikes(num: int, step: int, nearest: int, url: str):
         max_oi_ce_strike = max_oi_pe_strike = 0
         oi_data_list = []
 
-        for item in data["records"]["data"]:
+        for item in rec["data"]:
             if item.get("expiryDate") != curr_expiry:
                 continue
             sp = item["strikePrice"]
@@ -317,7 +353,8 @@ def _get_highest_oi_strikes(num: int, step: int, nearest: int, url: str):
 
         oi_data_list.sort(key=lambda x: x["strike"])
         return oi_data_list, int(max_oi_ce_strike), int(max_oi_pe_strike), curr_expiry
-    except Exception:
+    except Exception as e:
+        print(f"_get_highest_oi_strikes error: {e}")
         return [], 0, 0, ""
 
 
