@@ -75,7 +75,7 @@ if "NSE_FETCHER_VERSION" not in src:
         "Please re-upload the v5.3 ZIP and re-run this cell.\n"
         "Old file at: " + spec.origin
     )
-print("✓ nse_fetcher.py is v5.3.2 (correct)")
+print("✓ nse_fetcher.py is v5.4 (correct)")
 
 # ── 7. Run the dashboard ──────────────────────────────────────────
 print("\nStarting NSE OI Dashboard v5.3...\n")
