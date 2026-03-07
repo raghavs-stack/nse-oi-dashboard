@@ -249,7 +249,8 @@ def main():
         print(f"  Next market open: {next_open_str()}")
     print("=" * 68)
 
-    session  = None if use_demo else create_session()
+    if not use_demo:
+        create_session()
     cycle    = 0
     eod_done = False
 
@@ -262,17 +263,15 @@ def main():
                 data = demo_data(SYMBOL, cycle)
             else:
                 vix  = fetch_vix()
-                data = fetch_chain(session, SYMBOL)
-                if not data:   # catches None AND {} (Cloudflare empty block)
-                    print(f"No data (NSE returned {type(data).__name__}). "
+                data = fetch_chain(None, SYMBOL)
+                if not data:
+                    print(f"No data from NSE. "
                           f"Next open: {next_open_str()}. Retrying in {REFRESH_RATE}s...")
                     if not is_market_open():
                         print("Switching to Demo Mode...")
                         use_demo = True
                     time.sleep(REFRESH_RATE)
                     continue
-                if cycle % 10 == 0:
-                    session = create_session()
 
             sig = process_cycle(data, SYMBOL, vix, use_demo, cycle)
 

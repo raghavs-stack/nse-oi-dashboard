@@ -51,7 +51,8 @@ class OITkApp:
         self._use_demo        = (True  if DEMO_MODE is True  else
                                  False if DEMO_MODE is False else
                                  not is_market_open())
-        self._session         = None if self._use_demo else create_session()
+        if not self._use_demo:
+            create_session()  # nsepython ✓
         self._eod_done        = False
         self._selected_expiry = None
         self._expiry_list     = []
@@ -456,13 +457,13 @@ class OITkApp:
                     data = demo_data(SYMBOL, self._cycle)
                 else:
                     vix  = fetch_vix()
-                    data = fetch_chain(self._session, SYMBOL)
+                    data = fetch_chain(None, SYMBOL)
                     if data is None:
                         self.root.after(0, lambda: self.lbl_status.config(
                             text=f"No data — retrying in 30s"))
                         return
                     if self._cycle % 10 == 0:
-                        self._session = create_session()
+                        pass  # nsepython manages its own session
 
                 sig = self._process_cycle(
                     data, SYMBOL, vix, self._use_demo, self._cycle,
