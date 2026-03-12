@@ -1,8 +1,0 @@
-pandas>=2.0.0
-matplotlib>=3.7.0
-yfinance>=0.2.40
-NorenRestApiPy>=1.0.0
-pyotp>=2.8.0
-pytz>=2023.3
-streamlit>=1.32.0
-requests>=2.31.0
