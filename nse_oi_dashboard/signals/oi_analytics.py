@@ -9,12 +9,25 @@ import pandas as pd
 from typing import Optional
 
 import state
+import config as _cfg
 from config import (
     PCR_THRESHOLDS, LOCALIZED_PCR_RANGE,
-    ROC_THRESHOLD, REFRESH_RATE,
+    ROC_THRESHOLD, ROC_THRESHOLD_SYMBOL, REFRESH_RATE,
     MAX_TRADES_PER_DAY, MIN_SIGNAL_SCORE, MIN_TRADE_GAP_MINS,
+    MAX_TRADES_PER_DAY_SYMBOL, MIN_TRADE_GAP_MINS_SYMBOL, SAME_BIAS_OVERRIDE_SCORE,
     LOT_SIZE,
 )
+
+# Per-symbol OI normalizer: threshold for "strong" intraday net OI addition = full 15 pts.
+# Updated for NSE Jan-2026 revised lot sizes:
+#   NIFTY 50→65  (+30%): scale 200K → 260K
+#   BANKNIFTY 15→30 (+100%): scale 35K → 70K
+_OI_NORMALIZER = {
+    "NIFTY":       260_000,   # lot 65 (NSE Jan-2026); was 200K at lot 50
+    "BANKNIFTY":    70_000,   # lot 30 (NSE Jan-2026); was 35K at lot 15
+    "FINNIFTY":     50_000,   # lot unchanged — verify if NSE revised
+    "MIDCPNIFTY":   25_000,   # lot unchanged — verify if NSE revised
+}
 from core.market_hours import now_ist
 from core.nse_fetcher import nearest_strike, strike_step
 
@@ -98,9 +111,10 @@ def compute_roc_alerts(data_items: list, expiry: str) -> list[str]:
         if s in state.prev_oi:
             ce_d = co - state.prev_oi[s]["CE"]
             pe_d = po - state.prev_oi[s]["PE"]
-            if ce_d > ROC_THRESHOLD:
+            _thr = ROC_THRESHOLD_SYMBOL.get(_cfg.SYMBOL, ROC_THRESHOLD)
+            if ce_d > _thr:
                 alerts.append(f"CALL BUILDUP  Strike {int(s):,}  +{ce_d:,} OI/{REFRESH_RATE}s")
-            if pe_d > ROC_THRESHOLD:
+            if pe_d > _thr:
                 alerts.append(f"PUT  BUILDUP  Strike {int(s):,}  +{pe_d:,} OI/{REFRESH_RATE}s")
     state.prev_oi = new_state
     return alerts
@@ -121,25 +135,50 @@ def compute_roc_alerts(data_items: list, expiry: str) -> list[str]:
 #  ─────────────────────────────────────────
 #  Total                                100
 def score_signal(bias, votes, pcr, net_score, spot, max_pain,
-                 vix_str, roc_alerts, tech_signal="NEUTRAL") -> tuple:
-    """Returns (score: int, breakdown: dict, unanimous: bool)."""
+                 vix_str, roc_alerts, tech_signal="NEUTRAL",
+                 dealer_vote="NEUTRAL", pcr_trend_bars: int = 0) -> tuple:
+    """
+    Returns (score: int, breakdown: dict, unanimous: bool).
+
+    v5.7 scoring improvements vs original:
+      Fix 1  Unanimity   — proportional (votes/total × 20) not cliff-edge
+      Fix 2  PCR trend   — rising PCR adds up to 5 confirmation bonus pts
+      Fix 3  OI normalizer — per-symbol (BNF 80K, NF 300K)
+      Fix 4  Max Pain    — proximity bonus regardless of direction
+      Fix 5  VIX         — high VIX on trending days is GOOD, not bad
+    """
     pts = {}
 
-    unanimous          = len(set(votes)) == 1
-    pts["unanimity"]   = 20 if unanimous else (10 if votes.count(bias) >= 3 else 0)
-    pts["pcr"]         = min(15, int(abs(pcr - 1.0) * 38))
-    pts["oi_score"]    = min(15, int(abs(net_score) / 300_000 * 15))
+    # Fix 1: Proportional unanimity — X out of N active votes matching bias
+    active_votes = [v for v in votes if v != "NEUTRAL"]
+    total_v      = max(len(active_votes), 1)
+    agree_v      = active_votes.count(bias)
+    unanimous    = agree_v == total_v and total_v >= 2
+    pts["unanimity"] = int((agree_v / total_v) * 20)
 
-    pain_dist          = abs(spot - max_pain)
-    moving_toward      = ((bias == "BULLISH" and spot < max_pain)
-                          or (bias == "BEARISH" and spot > max_pain))
-    pts["max_pain"]    = min(10, int(pain_dist / 50) * 2) if moving_toward else 0
+    # Fix 2: PCR with trend bonus — rising PCR (bearish signal) = extra pts
+    pcr_base  = min(15, int(abs(pcr - 1.0) * 38))
+    pcr_trend = min(5, pcr_trend_bars) if (
+        (bias == "BEARISH" and pcr_trend_bars > 0)  # PCR rising = bearish confirm
+        or (bias == "BULLISH" and pcr_trend_bars < 0)  # PCR falling = bullish confirm
+    ) else 0
+    pts["pcr"] = min(20, pcr_base + abs(pcr_trend))
 
+    # Fix 3: Per-symbol OI normalizer
+    sym        = _cfg.SYMBOL
+    normalizer = _OI_NORMALIZER.get(sym, 300_000)
+    pts["oi_score"] = min(15, int(abs(net_score) / normalizer * 15))
+
+    # Fix 4: Max pain proximity — far from pain = gravitational pull exists
+    pain_dist = abs(spot - max_pain)
+    pts["max_pain"] = min(10, int(pain_dist / 100) * 2)
+
+    # Fix 5: VIX — high VIX on trending days = BETTER signal (bigger moves)
     try:
         vix = float(vix_str)
-        pts["vix"] = (10 if 12 <= vix <= 18 else
-                      6  if 18 < vix <= 22  else
-                      2  if vix > 22         else 4)
+        pts["vix"] = (10 if 18 <= vix <= 26 else   # trending/volatile = ideal
+                       8 if 12 <= vix < 18  else   # calm = good
+                       4 if vix > 26        else 4) # extreme panic = cautious
     except (ValueError, TypeError):
         pts["vix"] = 5
 
@@ -152,9 +191,17 @@ def score_signal(bias, votes, pcr, net_score, spot, max_pain,
     for alert in roc_alerts:
         if bias == "BULLISH" and "CALL" in alert: roc_bonus = 5; break
         if bias == "BEARISH" and "PUT"  in alert: roc_bonus = 5; break
-    pts["roc"]       = roc_bonus
-    pts["rsi_vwap"]  = (15 if tech_signal == bias else
-                        5  if tech_signal == "NEUTRAL" else 0)
+    pts["roc"]      = roc_bonus
+    pts["rsi_vwap"] = (10 if tech_signal == bias else
+                       4  if tech_signal == "NEUTRAL" else 0)
+    pts["dealer"]   = (5 if dealer_vote == bias else
+                       2 if dealer_vote == "NEUTRAL" else 0)
+
+    # Factor 9: Trend persistence — reward signals confirmed across many cycles.
+    # Every 10 consecutive cycles with same bias adds 1 pt, up to 10 pts.
+    # Prevents single-cycle noise from triggering while rewarding clear trends.
+    _consec = getattr(state, "consecutive_bias_cycles", 0)
+    pts["trend_persist"] = min(10, (_consec // 10))
 
     return min(100, sum(pts.values())), pts, unanimous
 
@@ -162,21 +209,54 @@ def score_signal(bias, votes, pcr, net_score, spot, max_pain,
 # ────────────────────────────────────────────────────────────────
 #  Trade Filter
 # ────────────────────────────────────────────────────────────────
-def should_take_trade(score: int, bias: str) -> tuple[bool, str]:
-    """4-gate filter. Returns (take: bool, reason: str)."""
-    if state.daily_trades_taken >= MAX_TRADES_PER_DAY:
-        return False, f"Daily cap reached ({MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_DAY})"
+def should_take_trade(score: int, bias: str, spot: float = 0) -> tuple[bool, str]:
+    """
+    4-gate trade filter. Returns (take: bool, reason: str).
+
+    Gates (in order):
+      1. Daily cap           — per-symbol (BNF=5, NF=3)
+      2. Minimum score       — 55
+      3. Minimum time gap    — per-symbol (BNF=15min, NF=20min)
+      4. Same-bias guard     — blocked unless score ≥70 OR spot moved ≥2 strikes
+         EXCEPTION: bias reversal (last was BEARISH, now BULLISH) → no gap needed
+    """
+    import config as _cfg
+    sym      = _cfg.SYMBOL
+    max_cap  = MAX_TRADES_PER_DAY_SYMBOL.get(sym, MAX_TRADES_PER_DAY)
+    min_gap  = MIN_TRADE_GAP_MINS_SYMBOL.get(sym, MIN_TRADE_GAP_MINS)
+    sb_score = SAME_BIAS_OVERRIDE_SCORE
+
+    if state.daily_trades_taken >= max_cap:
+        return False, f"Daily cap reached ({max_cap}/{max_cap})"
     if score < MIN_SIGNAL_SCORE:
         return False, f"Score {score}/100 < min {MIN_SIGNAL_SCORE}"
-    if state.last_trade_time is not None:
-        gap = (now_ist() - state.last_trade_time).seconds // 60
-        if gap < MIN_TRADE_GAP_MINS:
-            return False, f"Too soon after last trade ({gap}min < {MIN_TRADE_GAP_MINS}min gap)"
-    taken = [s for s in state.signal_log if s.taken]
-    if taken and taken[-1].bias == bias:
-        return False, f"Same bias ({bias}) as last taken trade — wait for reversal"
-    return True, "PASS"
 
+    # Check time gap — skip for bias reversals (new direction = new opportunity)
+    taken_log = [s for s in state.signal_log if s.taken]
+    is_reversal = bool(taken_log) and taken_log[-1].bias != bias
+    if state.last_trade_time is not None and not is_reversal:
+        gap = (now_ist() - state.last_trade_time).seconds // 60
+        if gap < min_gap:
+            return False, f"Too soon after last trade ({gap}min < {min_gap}min gap)"
+
+    # Same-bias guard — prevent chasing a fading move.
+    # Override: (a) high-conviction score >= SAME_BIAS_OVERRIDE_SCORE
+    #           (b) spot has moved >= 2 strike steps since last same-bias entry
+    if taken_log and taken_log[-1].bias == bias:
+        last_spot  = taken_log[-1].spot
+        from core.nse_fetcher import strike_step
+        _step      = strike_step(sym)
+        spot_moved = abs(spot - last_spot) >= _step * 2 if spot and last_spot else False
+
+        if score >= sb_score:
+            pass  # high-confidence: allow
+        elif spot_moved:
+            pass  # price at new level: allow
+        else:
+            return False, (f"Same bias ({bias}) as last trade — "
+                           f"score {score} < {sb_score} and spot hasn't moved >= 2 strikes")
+
+    return True, "PASS"
 
 def register_trade_taken():
     state.daily_trades_taken += 1

@@ -465,9 +465,10 @@ class OITkApp:
                     if self._cycle % 10 == 0:
                         pass  # nsepython manages its own session
 
-                sig = self._process_cycle(
+                result = self._process_cycle(
                     data, SYMBOL, vix, self._use_demo, self._cycle,
                     selected_expiry=self._selected_expiry)
+                sig, adv, _df, _pcr, _dq, _sc = result if result else (None, {}, None, {}, {}, {})
 
                 if sig:
                     state.signal_log.append(sig)

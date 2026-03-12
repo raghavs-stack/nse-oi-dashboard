@@ -24,12 +24,7 @@ def strike_step(sym):        return 100 if sym == "BANKNIFTY" else 50
 def create_session():
     """Login to Shoonya. Called once at startup."""
     from core.shoonya_client import login
-    ok = login()
-    if not ok:
-        raise RuntimeError(
-            "Shoonya login failed. Check credentials.py and try again.\n"
-            "Make sure TOTP_KEY is the secret key, not the 6-digit code."
-        )
+    login()   # raises RuntimeError on failure with full message
 
 
 # ── Option chain fetch ────────────────────────────────────────────

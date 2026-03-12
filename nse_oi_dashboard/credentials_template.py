@@ -9,8 +9,10 @@
 #    TOTP_KEY     → the secret key shown when you set up 2FA in Shoonya app
 #                   (the text/QR code secret, NOT the 6-digit code itself)
 #                   Settings → Security → Authenticator → "Can't scan? Use key"
-#    VENDOR_CODE  → from Shoonya API dashboard (api.shoonya.com)
-#    API_SECRET   → from Shoonya API dashboard
+#    VENDOR_CODE  → api.shoonya.com → My Apps → your app → "Vendor Code"
+#                   Format is typically YOUR_USER_ID + "_U"  e.g. "FA12345_U"
+#    API_SECRET   → api.shoonya.com → My Apps → your app → "API Key"
+#                   (the long hex string, NOT your login password)
 #    IMEI         → any string, e.g. "abc1234"
 # ════════════════════════════════════════════════════════════════
 
@@ -20,3 +22,11 @@ SHOONYA_TOTP_KEY    = "YOUR_TOTP_SECRET_KEY"   # secret key, not the 6-digit cod
 SHOONYA_VENDOR_CODE = "YOUR_VENDOR_CODE"
 SHOONYA_API_SECRET  = "YOUR_API_SECRET"
 SHOONYA_IMEI        = "abc1234"
+
+# ── Telegram Alerts (optional) ────────────────────────────────────
+# Leave as-is to disable. Setup:
+#   1. Message @BotFather → /newbot → copy the token
+#   2. Message your bot, then visit:
+#      https://api.telegram.org/bot<TOKEN>/getUpdates  to get your chat_id
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID   = "YOUR_TELEGRAM_CHAT_ID"

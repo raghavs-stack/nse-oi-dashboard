@@ -1,7 +1,7 @@
 # ════════════════════════════════════════════════════════════════
 #  display/terminal.py
 #  Non-scrolling terminal / Colab display.
-#  v5.3: adds IV section (ATM IV, IVR, IVP, daily IV, skew).
+#  v5.6: adds IV section + GEX + SmartMoney + Flow + Dealer (ATM IV, IVR, IVP, daily IV, skew).
 # ════════════════════════════════════════════════════════════════
 
 import os
@@ -49,7 +49,8 @@ def render(df, symbol, spot, vix, expiry, pcr, bias,
            rsi=None, vwap=None, tech_signal="NEUTRAL",
            pcr_signal="NEUTRAL", pcr_signal_color="#f39c12",
            local_pcr=None,
-           iv_data: dict = None):
+           iv_data: dict = None,
+           adv: dict = None):
     """
     Atomic screen update — builds full output then clears and prints at once.
     In tkinter mode this is a no-op (OITkApp handles its own rendering).
@@ -72,7 +73,7 @@ def render(df, symbol, spot, vix, expiry, pcr, bias,
 
     # ── Header ───────────────────────────────────────────────────
     a(SEP)
-    a(f"  {symbol} OI DASHBOARD v5.3 [{mode_tag}]  "
+    a(f"  {symbol} OI DASHBOARD v5.6 [{mode_tag}]  "
       f"{now_ist().strftime('%H:%M:%S IST')}  Cycle #{cycle}")
     a(f"  Spot: Rs{spot:,.2f}  |  VIX: {vix}  |  Expiry: {expiry}  |  Lot: {LOT_SIZE}")
     a(SEP)
@@ -126,7 +127,8 @@ def render(df, symbol, spot, vix, expiry, pcr, bias,
           f"VIX:{bd.get('vix',0):>2}  "
           f"Time:{bd.get('time',0):>2}  "
           f"RoC:{bd.get('roc',0):>2}  "
-          f"RSI+VWAP:{bd.get('rsi_vwap',0):>2}")
+          f"RSI+VWAP:{bd.get('rsi_vwap',0):>2}  "
+          f"Dealer:{bd.get('dealer',0):>2}")
     a(filter_line)
     a(THN)
 
@@ -159,6 +161,37 @@ def render(df, symbol, spot, vix, expiry, pcr, bias,
         a("  ** RATE-OF-CHANGE ALERTS **")
         for al in roc_alerts:
             a(f"  >> {al}")
+        a(THN)
+
+    # ── Advanced analytics (v5.6 NEW) ────────────────────────────
+    if adv:
+        g   = adv.get("gamma",       {})
+        sm  = adv.get("smart_money", {})
+        fl  = adv.get("flow",        {})
+        dh  = adv.get("dealer",      {})
+        brk = adv.get("breakout",    {})
+
+        a(f"  ADVANCED ANALYTICS")
+        regime_icon = "▲" if g.get("regime") == "Positive Gamma" else "▼"
+        a(f"  GEX: {regime_icon} {g.get('regime','N/A')}  "
+          f"Net={int(g.get('net_gex',0)):+,}  "
+          f"Flip @ Rs{g.get('flip_level','N/A'):,}")
+        a(f"  Dealer: {dh.get('bias','N/A')} ({dh.get('vote','N/A')})  "
+          f"Pressure: {int(dh.get('pressure',0)):+,}  "
+          f"Flow Bias: {fl.get('bias','N/A')}")
+        # calls/puts are now 3-tuples: (strike, oi_change, score)
+        def _sm_strike(item): return str(item[0]) if isinstance(item,(list,tuple)) else str(item)
+        def _sm_oi(item): return item[1] if isinstance(item,(list,tuple)) and len(item)>1 else 0
+        sm_calls = [f"{_sm_strike(x)}(+{_sm_oi(x):,})" for x in sm.get("calls",[])]
+        sm_puts  = [f"{_sm_strike(x)}(+{_sm_oi(x):,})" for x in sm.get("puts",[])]
+        mode_tag = f" [{sm.get('mode','')}]" if sm.get("mode") else ""
+        a(f"  SmartMoney{mode_tag} → Calls: {', '.join(sm_calls) or 'N/A'}"
+          f"  |  Puts: {', '.join(sm_puts) or 'N/A'}"
+          f"  |  Dominant: {sm.get('dominant','N/A')}")
+        if brk.get("breakout"):
+            a(f"  ** {brk.get('signal')} **  "
+              f"Resistance: Rs{brk.get('resistance','N/A'):,}  "
+              f"Support: Rs{brk.get('support','N/A'):,}")
         a(THN)
 
     # ── Context ───────────────────────────────────────────────────
