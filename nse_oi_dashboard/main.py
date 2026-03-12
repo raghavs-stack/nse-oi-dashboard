@@ -7,7 +7,7 @@
 #    python main.py             # terminal / Colab
 #    python main.py --gui       # Tkinter GUI (local PC only)
 #
-#  pip install requests pandas matplotlib yfinance
+#  pip install pandas matplotlib yfinance NorenRestApiPy pyotp streamlit
 # ════════════════════════════════════════════════════════════════
 
 import sys, os, math, random, time
@@ -44,12 +44,49 @@ from signals.iv_analytics import (
     calc_atm_iv, calc_iv_skew, IVTracker, IVHistory,
     interpret_iv,
 )
+from signals.advanced_analytics import run_advanced_analytics
+from signals.multi_pcr import PCRSeries, classify_expiries, calc_pcr_for_expiry
+from signals.trade_calendar import get_day_quality
+from signals.strategy_classifier import classify_strategy, format_strategy_panel
+from alerts.telegram_alerts import (
+    init_telegram, send_signal, send_breakout, send_roc_alert, send_eod_summary,
+)
 from display.terminal import render
 from backtest.eod_backtest import Signal, run_eod_backtest
+import json
 
 # ── Singleton IV objects (persist across cycles) ─────────────────
-iv_tracker = IVTracker()
-iv_history = IVHistory()
+iv_tracker  = IVTracker()
+iv_history  = IVHistory()
+pcr_series  = PCRSeries()          # Weekly + Monthly PCR with EMA/VWAP
+
+
+# ════════════════════════════════════════════════════════════════
+#  Per-symbol state container (for --both mode)
+# ════════════════════════════════════════════════════════════════
+class SymbolEngine:
+    """Holds all per-symbol singletons so two symbols can run in one process."""
+    def __init__(self, symbol: str):
+        self.symbol      = symbol
+        # NSE revised lot sizes from Jan-2026 expiry cycle
+        self.lot_size    = {"NIFTY": 65, "BANKNIFTY": 30,
+                            "FINNIFTY": 40, "MIDCPNIFTY": 75}.get(symbol, 65)
+        import datetime as _dt
+        today = _dt.datetime.now().strftime("%Y%m%d")
+        self.log_file    = f"{symbol}_OI_{today}.csv"
+        self.iv_hist_file= f"{symbol}_iv_history.csv"
+        self.plot_file   = f"{symbol}_chart.png"
+        self.iv_tracker  = IVTracker()
+        self.iv_history  = IVHistory(filepath=self.iv_hist_file)
+        self.pcr_series  = PCRSeries()
+        self.signal_log  = []
+        self.pcr_bearish = config.PCR_BEARISH
+        self.pcr_bullish = config.PCR_BULLISH
+        self.trades_today= 0
+        self.last_trade_t= None
+        self.strategy_engine = StrategyEngine()
+        self.eod_done    = False
+        self.cycle       = 0
 
 
 # ════════════════════════════════════════════════════════════════
@@ -57,22 +94,22 @@ iv_history = IVHistory()
 # ════════════════════════════════════════════════════════════════
 def process_cycle(data: dict, symbol: str, vix: str,
                   demo: bool, cycle: int,
-                  selected_expiry: str = None) -> Signal | None:
+                  selected_expiry: str = None):
 
     # Validate response structure before touching any key
     if not isinstance(data, dict) or "records" not in data:
         print(f"process_cycle: bad data shape — keys={list(data.keys()) if isinstance(data,dict) else type(data)}")
-        return None
+        return None, {}, pd.DataFrame(), {}, {}, {}
 
     rec = data["records"]
     if not isinstance(rec, dict):
         print(f"process_cycle: 'records' is not a dict (type={type(rec)})")
-        return None
+        return None, {}, pd.DataFrame(), {}, {}, {}
 
     spot = rec.get("underlyingValue")
     if not spot:
         print(f"process_cycle: missing underlyingValue — rec keys={list(rec.keys())}")
-        return None
+        return None, {}, pd.DataFrame(), {}, {}, {}
     spot = float(spot)
     avail  = rec.get("expiryDates", [])
     expiry = (selected_expiry if selected_expiry and selected_expiry in avail
@@ -81,15 +118,15 @@ def process_cycle(data: dict, symbol: str, vix: str,
     raw_data = rec.get("data", [])
     if not raw_data:
         print("process_cycle: empty data list in records")
-        return None
+        return None, {}, pd.DataFrame(), {}, {}, {}
 
     df = build_df(raw_data, expiry)
     if df.empty:
-        return None
+        return None, {}, pd.DataFrame(), {}, {}, {}
 
     total_ce = df["CE_OI"].sum()
     if total_ce == 0:
-        return None
+        return None, {}, pd.DataFrame(), {}, {}, {}
     total_pe = df["PE_OI"].sum()
 
     # ── PCR ────────────────────────────────────────────────────
@@ -98,9 +135,50 @@ def process_cycle(data: dict, symbol: str, vix: str,
     pcr_for_bias  = local_pcr if local_pcr is not None else pcr
     pcr_signal, pcr_signal_color = generate_pcr_signal(pcr_for_bias)
 
-    # ── Resistance / Support (from max ΔOI — fresh money) ─────
-    resistance = int(df.loc[df["CE_Chg"].idxmax(), "Strike"])
-    support    = int(df.loc[df["PE_Chg"].idxmax(), "Strike"])
+    # ── Multi-expiry PCR (Weekly + Monthly) ──────────────────
+    expiry_map  = classify_expiries(avail)
+    weekly_exp  = expiry_map.get("weekly")
+    monthly_exp = expiry_map.get("monthly")
+    weekly_pcr  = calc_pcr_for_expiry(raw_data, weekly_exp)  if weekly_exp  else None
+    monthly_pcr = calc_pcr_for_expiry(raw_data, monthly_exp) if monthly_exp else None
+    total_oi    = float(df["CE_OI"].sum() + df["PE_OI"].sum())
+    pcr_data    = pcr_series.update(pcr_for_bias, weekly_pcr, monthly_pcr, total_oi)
+
+    # ── Day quality + trade calendar ──────────────────────────
+    day_qual = get_day_quality(symbol)
+
+    # ── Resistance / Support ───────────────────────────────────
+    # Resistance = nearest overhead strike (above spot) with max CE OI
+    # Support    = nearest underfoot strike (below spot) with max PE OI
+    # Constrained to ATM ± 20 strikes to avoid irrelevant far-OTM picks.
+    _step  = strike_step(symbol)
+    _range = _step * 20   # 20 strikes each side (1000 NF / 2000 BNF)
+
+    # ── Intraday resistance / support (for signal generation) ────
+    # Constrained: overhead CE wall and underfoot PE wall.
+    # Used for trade entry context (direction of nearest OI pressure).
+    _ce_above = df[(df["Strike"] > spot) & (df["Strike"] <= spot + _range)].copy()
+    _pe_below = df[(df["Strike"] < spot) & (df["Strike"] >= spot - _range)].copy()
+
+    if not _ce_above.empty:
+        _ce_above = _ce_above[_ce_above["CE_OI"] > 0]
+        resistance = int(_ce_above.loc[_ce_above["CE_OI"].idxmax(), "Strike"])                      if not _ce_above.empty else int(spot + _step * 5)
+    else:
+        resistance = int(spot + _step * 5)
+
+    if not _pe_below.empty:
+        _pe_below = _pe_below[_pe_below["PE_OI"] > 0]
+        support = int(_pe_below.loc[_pe_below["PE_OI"].idxmax(), "Strike"])                   if not _pe_below.empty else int(spot - _step * 5)
+    else:
+        support = int(spot - _step * 5)
+
+    # ── Forward-looking levels (for EOD "Levels to Watch Tomorrow") ──
+    # Uses UNCONSTRAINED max OI strikes — these represent where writers have
+    # the most exposure regardless of whether they are currently above/below spot.
+    _full = df[df["CE_OI"] > 0].copy()
+    _full_pe = df[df["PE_OI"] > 0].copy()
+    ce_max_oi_strike = int(_full.loc[_full["CE_OI"].idxmax(), "Strike"])                        if not _full.empty else resistance
+    pe_max_oi_strike = int(_full_pe.loc[_full_pe["PE_OI"].idxmax(), "Strike"])                        if not _full_pe.empty else support
 
     # ── Volume-weighted OI score ───────────────────────────────
     weighted_net_score = int(
@@ -135,22 +213,68 @@ def process_cycle(data: dict, symbol: str, vix: str,
                   "BEARISH" if spot > max_pain else "NEUTRAL")
     rsi_val, vwap_val, tech_signal = state.strategy_engine.on_tick(spot)
 
-    votes = [pcr_bias, score_bias, pain_bias, tech_signal]
+    from signals.advanced_analytics import run_advanced_analytics
+    adv = run_advanced_analytics(df, spot)
+    dealer_vote = adv["dealer"]["vote"]
+
+    votes = [pcr_bias, score_bias, pain_bias, tech_signal, dealer_vote]
     bias  = max(set(votes), key=votes.count)
+
+    # Track trend persistence for scoring
+    if bias == state._last_bias and bias != "NEUTRAL":
+        state.consecutive_bias_cycles += 1
+    else:
+        state.consecutive_bias_cycles = 1 if bias != "NEUTRAL" else 0
+    state._last_bias = bias
+
+    # ── Strategy classifier ───────────────────────────────────
+    strat_class = classify_strategy(
+        bias         = bias,
+        ivr          = hist_summ.get("ivr"),
+        ivp          = hist_summ.get("ivp"),
+        atm_iv       = atm_iv,
+        score        = 0,            # placeholder; updated after score_signal
+        days_to_exp  = day_qual["days_to_weekly"],
+        day_quality  = day_qual["composite_score"],
+        pcr_div_sig  = pcr_data.get("div_signal", "ALIGNED"),
+    )
 
     # ── Recommendations ────────────────────────────────────────
     recs = recommend_strikes(df, spot, bias, max_pain, resistance, support, symbol)
     if len(recs) < 3:
-        return None
+        return None, {}, pd.DataFrame(), {}, {}, {}
 
     # ── Signal score ───────────────────────────────────────────
+    # pcr_trend_bars: +N if PCR has been rising N cycles (bearish confirm),
+    #                  -N if falling N cycles (bullish confirm)
+    _pcr_hist = list(pcr_series.local) if pcr_series.local else []
+    if len(_pcr_hist) >= 3:
+        _window = _pcr_hist[-min(5, len(_pcr_hist)):]
+        _rising = sum(1 for i in range(1, len(_window)) if _window[i] > _window[i-1])
+        _falling= sum(1 for i in range(1, len(_window)) if _window[i] < _window[i-1])
+        pcr_trend_bars = _rising if _rising > _falling else -_falling
+    else:
+        pcr_trend_bars = 0
+
     score, breakdown, unanimous = score_signal(
         bias, votes, pcr_for_bias, weighted_net_score, spot, max_pain,
-        vix, roc_alerts, tech_signal
+        vix, roc_alerts, tech_signal, dealer_vote=dealer_vote,
+        pcr_trend_bars=pcr_trend_bars
+    )
+    # Re-run classifier with real score now known
+    strat_class = classify_strategy(
+        bias         = bias,
+        ivr          = hist_summ.get("ivr"),
+        ivp          = hist_summ.get("ivp"),
+        atm_iv       = atm_iv,
+        score        = score,
+        days_to_exp  = day_qual["days_to_weekly"],
+        day_quality  = day_qual["composite_score"],
+        pcr_div_sig  = pcr_data.get("div_signal", "ALIGNED"),
     )
 
     # ── Trade filter ───────────────────────────────────────────
-    take, filter_reason = should_take_trade(score, bias)
+    take, filter_reason = should_take_trade(score, bias, spot=spot)
     if take:
         register_trade_taken()
 
@@ -159,6 +283,7 @@ def process_cycle(data: dict, symbol: str, vix: str,
         "Timestamp":    rec.get("timestamp", now_ist().strftime("%d-%b-%Y %H:%M:%S")), "Spot": spot, "VIX": vix,
         "PCR_Full": pcr, "PCR_Local": local_pcr, "PCR_Signal": pcr_signal,
         "MaxPain": max_pain, "Resistance": resistance, "Support": support,
+        "CE_MaxOI_Strike": ce_max_oi_strike, "PE_MaxOI_Strike": pe_max_oi_strike,
         "WeightedScore": weighted_net_score, "RawOIScore": raw_net_score,
         "Bias": bias,
         "RSI":    round(rsi_val,  2) if rsi_val  else "warming",
@@ -174,9 +299,19 @@ def process_cycle(data: dict, symbol: str, vix: str,
         # v5.3 IV columns
         "ATM_IV": atm_iv, "IVR": hist_summ.get("ivr"), "IVP": hist_summ.get("ivp"),
         "IV_Skew_Pct": iv_skew.get("skew_pct"), "IV_Skew_Dir": iv_skew.get("direction"),
+        # v5.7 new fields
+        "PCR_Weekly": weekly_pcr, "PCR_Monthly": monthly_pcr,
+        "PCR_EMA20": pcr_data.get("ema20"), "PCR_VWAP": pcr_data.get("vwap"),
+        "PCR_Divergence": pcr_data.get("divergence"), "PCR_DivSignal": pcr_data.get("div_signal"),
+        "DayScore": day_qual["composite_score"], "DayLabel": day_qual["day_profile"]["label"],
+        "TimeWindow": day_qual["time_window"]["label"],
+        "DTE_Weekly": day_qual["days_to_weekly"], "DTE_Monthly": day_qual["days_to_monthly"],
+        "Strategy": strat_class["strategy_name"], "StrategyType": strat_class["strategy_type"],
+        "Conviction": strat_class["conviction"],
     }])
-    log_row.to_csv(LOG_FILE, mode="a",
-                   header=not os.path.exists(LOG_FILE), index=False)
+    _csv_path = config.LOG_FILE  # Always use current config, not module-level import
+    log_row.to_csv(_csv_path, mode="a",
+                   header=not os.path.exists(_csv_path), index=False)
 
     # ── Render (terminal / Colab) ──────────────────────────────
     render(df, symbol, spot, vix, expiry, pcr_for_bias, bias, max_pain,
@@ -185,9 +320,9 @@ def process_cycle(data: dict, symbol: str, vix: str,
            skip_reason=filter_reason, unanimous=unanimous,
            rsi=rsi_val, vwap=vwap_val, tech_signal=tech_signal,
            pcr_signal=pcr_signal, pcr_signal_color=pcr_signal_color,
-           local_pcr=local_pcr, iv_data=iv_data)
+           local_pcr=local_pcr, iv_data=iv_data, adv=adv)
 
-    return Signal(
+    sig = Signal(
         time=now_ist().strftime("%H:%M"),
         bias=bias, spot=spot, pcr=pcr_for_bias,
         rec1=recs[0], rec2=recs[1], rec3=recs[2],
@@ -197,16 +332,328 @@ def process_cycle(data: dict, symbol: str, vix: str,
         atm_iv=atm_iv, ivr=hist_summ.get("ivr"), ivp=hist_summ.get("ivp"),
         iv_skew_pct=iv_skew.get("skew_pct"), iv_skew_dir=iv_skew.get("direction", "N/A"),
     )
+    return sig, adv, df, pcr_data, day_qual, strat_class
+
+
+# ════════════════════════════════════════════════════════════════
+#  State writer for Streamlit frontend
+# ════════════════════════════════════════════════════════════════
+def _build_iv_chart(df, spot: float) -> dict:
+    """
+    Build IV skew chart data filtered to ATM ±12 strikes.
+    Strips zero-IV rows so the chart doesn't flatline outside market hours.
+    Returns {} if no valid IV data exists.
+    """
+    if df.empty or "CE_IV" not in df.columns:
+        return {}
+
+    from config import SYMBOL
+    step = 100 if SYMBOL == "BANKNIFTY" else 50
+    atm  = round(spot / step) * step
+
+    # Keep only ±12 strikes around ATM
+    mask = (df["Strike"] >= atm - 12 * step) & (df["Strike"] <= atm + 12 * step)
+    sub  = df[mask].copy()
+
+    if sub.empty:
+        return {}
+
+    # Only include rows where at least one IV is non-zero
+    has_iv = (sub["CE_IV"].fillna(0) > 0) | (sub["PE_IV"].fillna(0) > 0)
+    sub = sub[has_iv]
+
+    if sub.empty:
+        # All zeros — return flag so Streamlit can show a message
+        return {"no_data": True}
+
+    return {
+        "strikes": sub["Strike"].astype(int).tolist(),
+        "ce_iv":   sub["CE_IV"].fillna(0).tolist(),
+        "pe_iv":   sub["PE_IV"].fillna(0).tolist(),
+        "atm":     int(atm),
+    }
+
+
+def _write_streamlit_state(sig, adv: dict, df, spot: float, vix: str,
+                           pcr_data: dict = None, day_qual: dict = None,
+                           strat_class: dict = None):
+    """Write current cycle state to dashboard_state.json for Streamlit."""
+    atm_df = df[(df["Strike"] >= spot * 0.97) & (df["Strike"] <= spot * 1.03)]
+    state_data = {
+        "spot":    spot,
+        "vix":     vix,
+        "pcr":     sig.pcr    if sig else 0,
+        "bias":    sig.bias   if sig else "N/A",
+        "score":   sig.score  if sig else 0,
+        "atm_iv":  sig.atm_iv if sig else "N/A",
+        "ivr":     sig.ivr    if sig else "N/A",
+        "ivp":     sig.ivp    if sig else "N/A",
+        "adv":     adv or {},
+        "recs":    ([{"label": r.label, "strike": r.strike, "opt_type": r.opt_type,
+                      "premium": r.premium, "sl": r.sl, "target": r.target,
+                      "reason": r.reason}
+                     for r in [sig.rec1, sig.rec2, sig.rec3]] if sig else []),
+        "oi_chart": {
+            "strikes": atm_df["Strike"].astype(int).tolist(),
+            "ce_oi":   atm_df["CE_OI"].tolist(),
+            "pe_oi":   atm_df["PE_OI"].tolist(),
+        } if not atm_df.empty else {},
+        "iv_chart": _build_iv_chart(df, spot),
+        "ts":     now_ist().strftime("%H:%M:%S"),
+        "symbol": config.SYMBOL,
+        "pcr_series":  pcr_data    or {},
+        "day_quality": day_qual    or {},
+        "strat_class": strat_class or {},
+    }
+    state_file = f"dashboard_state_{config.SYMBOL}.json"
+    try:
+        with open(state_file, "w") as f:
+            json.dump(state_data, f)
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════
+#  Dual-symbol mode  (--both flag)
+#  Runs NIFTY + BANKNIFTY in ONE process with ONE shared Shoonya
+#  session — avoids the session-kick problem of running two processes.
+# ════════════════════════════════════════════════════════════════
+def _run_dual_mode(symbols=None):
+    """
+    Single-process dual-symbol loop.
+    Fetches NIFTY then BANKNIFTY (or any symbols list) sequentially
+    every REFRESH_RATE seconds, writing separate state files for each.
+
+    Usage:
+        python main.py --both
+        python main.py --both --symbols NIFTY BANKNIFTY FINNIFTY
+    """
+    if symbols is None:
+        # Parse --symbols list if provided, else default NIFTY + BANKNIFTY
+        if "--symbols" in sys.argv:
+            idx = sys.argv.index("--symbols")
+            symbols = [s.upper() for s in sys.argv[idx+1:]
+                       if s.upper() in ("NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY")]
+        if not symbols:
+            symbols = ["NIFTY", "BANKNIFTY"]
+
+    market_open = is_market_open()
+    use_demo    = (True  if config.DEMO_MODE is True  else
+                   False if config.DEMO_MODE is False else
+                   not market_open)
+
+    print("=" * 68)
+    print(f"  NSE LIVE OI DASHBOARD  v5.7  [DUAL MODE: {' + '.join(symbols)}]")
+    print(f"  One session, one process — no session-kick conflict")
+    print(f"  Mode: {'DEMO (markets closed)' if use_demo else 'LIVE'}")
+    print(f"  Refresh: {REFRESH_RATE}s per full cycle")
+    print("=" * 68)
+
+    engines = [SymbolEngine(sym) for sym in symbols]
+
+    if not use_demo:
+        print("Logging in to Shoonya (shared session) …")
+        create_session()
+        print("✓ Logged in")
+    init_telegram()
+
+    while True:
+        try:
+            cycle_start = time.time()
+
+            # Single VIX fetch shared by all symbols
+            if use_demo:
+                vix = str(round(14.5 + math.sin(sum(e.cycle for e in engines) * 0.3) * 2.5, 2))
+            else:
+                vix = fetch_vix()
+
+            for eng in engines:
+                try:
+                    print(f"  [{eng.symbol}] cycle {eng.cycle+1} …", end=" ", flush=True)
+                    run_symbol_cycle(eng, vix, use_demo)
+                    print("✓")
+                except Exception as e:
+                    print(f"✗ {e}")
+
+            elapsed = time.time() - cycle_start
+            sleep_t = max(1, REFRESH_RATE - elapsed)
+            time.sleep(sleep_t if not use_demo else 5)
+
+        except KeyboardInterrupt:
+            print("\n\nDual-mode stopped by user.")
+            for eng in engines:
+                if eng.signal_log:
+                    last = eng.signal_log[-1].spot
+                    for s in eng.signal_log:
+                        if s.spot_exit is None: s.spot_exit = last
+            break
+
+
+# ════════════════════════════════════════════════════════════════
+#  Single-symbol cycle runner (used by both single and dual mode)
+# ════════════════════════════════════════════════════════════════
+def run_symbol_cycle(eng: "SymbolEngine", vix: str, use_demo: bool) -> None:
+    """
+    Run one fetch-process-write cycle for a single symbol.
+    Uses the SymbolEngine's private singletons — fully isolated from
+    other symbols running in the same process.
+    """
+    # Temporarily point module-level globals to this engine's state
+    # (needed because process_cycle reads config.SYMBOL etc.)
+    # Declare globals first to avoid SyntaxError
+    global SYMBOL, LOT_SIZE, LOG_FILE
+
+    _prev_sym = config.SYMBOL
+    _prev_lot = config.LOT_SIZE
+    _prev_log = config.LOG_FILE
+    _prev_iv  = config.IV_HIST_FILE
+
+    config.SYMBOL       = eng.symbol
+    config.LOT_SIZE     = eng.lot_size
+    config.LOG_FILE     = eng.log_file
+    config.IV_HIST_FILE = eng.iv_hist_file
+    # Also sync module-level globals (used by process_cycle CSV write)
+    SYMBOL   = eng.symbol
+    LOT_SIZE = eng.lot_size
+    LOG_FILE = eng.log_file
+
+    # Swap module-level singletons
+    global iv_tracker, iv_history, pcr_series
+    _save_tracker = iv_tracker
+    _save_history = iv_history
+    _save_pcr     = pcr_series
+    iv_tracker = eng.iv_tracker
+    iv_history = eng.iv_history
+    pcr_series = eng.pcr_series
+
+    # Swap state singletons
+    import state as _state
+    _save_log    = _state.signal_log
+    _save_trades = _state.daily_trades_taken
+    _save_last_t = _state.last_trade_time
+    _save_bull   = _state.pcr_bullish
+    _save_bear   = _state.pcr_bearish
+    _save_engine = _state.strategy_engine
+    _state.signal_log          = eng.signal_log
+    _state.daily_trades_taken  = eng.trades_today
+    _state.last_trade_time     = eng.last_trade_t
+    _state.pcr_bullish         = eng.pcr_bullish
+    _state.pcr_bearish         = eng.pcr_bearish
+    _state.strategy_engine     = eng.strategy_engine
+
+    try:
+        eng.cycle += 1
+        if use_demo:
+            data = demo_data(eng.symbol, eng.cycle)
+        else:
+            from core.nse_fetcher import fetch_chain, fetch_vix
+            data = fetch_chain(None, eng.symbol)
+            if not data:
+                print(f"  [{eng.symbol}] fetch_chain returned no data")
+                return
+
+        result = process_cycle(data, eng.symbol, vix, use_demo, eng.cycle)
+        sig, adv, cycle_df, pcr_data, day_qual, strat_class = result
+        if sig is None:
+            return
+
+        _write_streamlit_state(
+            sig, adv, cycle_df,
+            data["records"]["underlyingValue"], vix,
+            pcr_data=pcr_data, day_qual=day_qual, strat_class=strat_class)
+
+        # Breakout / Telegram alerts
+        brk = adv.get("breakout", {}) if adv else {}
+        if brk.get("breakout"):
+            send_breakout(eng.symbol, data["records"]["underlyingValue"],
+                          brk["signal"], brk["resistance"], brk["support"])
+
+        if sig:
+            eng.signal_log.append(sig)
+            if len(eng.signal_log) >= 2:
+                prev = eng.signal_log[-2]
+                prev.spot_exit = sig.spot
+                prev.outcome = ("WIN" if
+                    (prev.bias == "BULLISH" and sig.spot > prev.spot)
+                    or (prev.bias == "BEARISH" and sig.spot < prev.spot)
+                    else "LOSS")
+                auto_tune(prev)
+
+        if sig and (sig.taken or sig.score >= 70):
+            send_signal(sig, adv)
+
+        if is_eod() and not eng.eod_done and not use_demo:
+            eng.eod_done = True
+            final_spot = data["records"]["underlyingValue"]
+            for s in eng.signal_log:
+                if s.spot_exit is None: s.spot_exit = final_spot
+            run_eod_backtest(final_spot)
+            current_iv = eng.iv_tracker._summary().get("current")
+            if current_iv:
+                eng.iv_history.update(current_iv)
+            wins   = sum(1 for s in eng.signal_log if s.outcome == "WIN")
+            losses = sum(1 for s in eng.signal_log if s.outcome == "LOSS")
+            send_eod_summary(eng.symbol, wins, losses, len(eng.signal_log), final_spot)
+
+        # Sync state back to engine
+        eng.trades_today = _state.daily_trades_taken
+        eng.last_trade_t = _state.last_trade_time
+        eng.pcr_bullish  = _state.pcr_bullish
+        eng.pcr_bearish  = _state.pcr_bearish
+
+    finally:
+        # Always restore config and module-level globals
+        config.SYMBOL       = _prev_sym
+        config.LOT_SIZE     = _prev_lot
+        config.LOG_FILE     = _prev_log
+        config.IV_HIST_FILE = _prev_iv
+        SYMBOL   = _prev_sym
+        LOT_SIZE = _prev_lot
+        LOG_FILE = _prev_log
+        iv_tracker = _save_tracker
+        iv_history = _save_history
+        pcr_series = _save_pcr
+        _state.signal_log         = _save_log
+        _state.daily_trades_taken = _save_trades
+        _state.last_trade_time    = _save_last_t
+        _state.pcr_bullish        = _save_bull
+        _state.pcr_bearish        = _save_bear
+        _state.strategy_engine    = _save_engine
 
 
 # ════════════════════════════════════════════════════════════════
 #  Main loop
 # ════════════════════════════════════════════════════════════════
 def main():
+    # ── Symbol override: python main.py --symbol BANKNIFTY ───────
+    if "--symbol" in sys.argv:
+        idx = sys.argv.index("--symbol")
+        if idx + 1 < len(sys.argv):
+            sym = sys.argv[idx + 1].upper()
+            if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                config.SYMBOL   = sym
+                config.LOT_SIZE = {"NIFTY": 65, "BANKNIFTY": 30,
+                                   "FINNIFTY": 40, "MIDCPNIFTY": 75}.get(sym, 65)
+                import datetime as _dt
+                _today = _dt.datetime.now().strftime("%Y%m%d")
+                config.LOG_FILE     = f"{sym}_OI_{_today}.csv"
+                config.PLOT_FILE    = f"{sym}_chart.png"
+                config.IV_HIST_FILE = f"{sym}_iv_history.csv"
+                # Re-import globals that were bound at module load time
+                global SYMBOL, LOT_SIZE, LOG_FILE
+                SYMBOL   = config.SYMBOL
+                LOT_SIZE = config.LOT_SIZE
+                LOG_FILE = config.LOG_FILE
+
     if "--gui" in sys.argv:
         config.DISPLAY_MODE = "tkinter"
     if "--terminal" in sys.argv:
         config.DISPLAY_MODE = "terminal"
+
+    # ── Dual-symbol mode: python main.py --both ────────────────
+    if "--both" in sys.argv:
+        _run_dual_mode()
+        return
 
     # ── Tkinter mode ──────────────────────────────────────────
     if config.DISPLAY_MODE == "tkinter":
@@ -239,7 +686,7 @@ def main():
                    not market_open)
 
     print("=" * 68)
-    print(f"  NSE LIVE OI DASHBOARD  v5.3  [{SYMBOL}]")
+    print(f"  NSE LIVE OI DASHBOARD  v5.6  [{SYMBOL}]")
     print(f"  Env: {'Colab' if IN_COLAB else 'Local'}  |  Lot: {LOT_SIZE}  |  Refresh: {REFRESH_RATE}s")
     print(f"  Mode: {'DEMO (markets closed)' if use_demo else 'LIVE'}")
     print(f"  4-vote: PCR + OI Score + Max Pain + RSI/VWAP")
@@ -251,6 +698,7 @@ def main():
 
     if not use_demo:
         create_session()
+    init_telegram()
     cycle    = 0
     eod_done = False
 
@@ -273,7 +721,26 @@ def main():
                     time.sleep(REFRESH_RATE)
                     continue
 
-            sig = process_cycle(data, SYMBOL, vix, use_demo, cycle)
+            result = process_cycle(data, SYMBOL, vix, use_demo, cycle)
+            sig, adv, cycle_df, pcr_data, day_qual, strat_class = result
+            if sig is None:
+                time.sleep(REFRESH_RATE); continue
+
+            # Write state for Streamlit
+            _write_streamlit_state(sig, adv, cycle_df,
+                                   data["records"]["underlyingValue"], vix,
+                                   pcr_data=pcr_data, day_qual=day_qual,
+                                   strat_class=strat_class)
+
+            # Breakout alert via Telegram
+            brk = adv.get("breakout", {}) if adv else {}
+            if brk.get("breakout"):
+                send_breakout(SYMBOL, data["records"]["underlyingValue"],
+                              brk["signal"], brk["resistance"], brk["support"])
+
+            # RoC alert via Telegram
+            if roc_alerts if "roc_alerts" in dir() else False:
+                send_roc_alert(SYMBOL, roc_alerts)
 
             if sig:
                 state.signal_log.append(sig)
@@ -286,6 +753,10 @@ def main():
                         else "LOSS")
                     auto_tune(prev)
 
+            # Send Telegram for taken trades or score > 70
+            if sig and (sig.taken or sig.score >= 70):
+                send_signal(sig, adv)
+
             if is_eod() and not eod_done and not use_demo:
                 eod_done = True
                 final_spot = data["records"]["underlyingValue"]
@@ -296,6 +767,9 @@ def main():
                 current_iv = iv_tracker._summary().get("current")
                 if current_iv:
                     iv_history.update(current_iv)
+                wins   = sum(1 for s in state.signal_log if s.outcome == "WIN")
+                losses = sum(1 for s in state.signal_log if s.outcome == "LOSS")
+                send_eod_summary(SYMBOL, wins, losses, len(state.signal_log), final_spot)
 
             time.sleep(5 if use_demo else REFRESH_RATE)
 

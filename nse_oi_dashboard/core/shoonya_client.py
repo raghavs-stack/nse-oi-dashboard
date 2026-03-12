@@ -1,89 +1,85 @@
 # ════════════════════════════════════════════════════════════════
-#  core/shoonya_client.py
-#  Shoonya (Finvasia) API wrapper for NSE option chain data.
-#  Handles login, TOTP, session management, and option chain fetch.
-#
-#  pip install NorenRestApiPy pyotp
+#  core/shoonya_client.py  v2 — Symbol Master approach
+#  Downloads NFO_symbols.txt.zip from Shoonya (no auth needed),
+#  extracts NIFTY/BANKNIFTY option tokens, then batch get_quotes.
+#  Bypasses the flaky get_option_chain endpoint entirely.
 # ════════════════════════════════════════════════════════════════
 
-import hashlib, time, threading
-from datetime import datetime
+import io, os, sys, time, threading, zipfile
+from datetime import date, datetime, timedelta
 from typing import Optional
 
-# ── Shoonya API class ─────────────────────────────────────────────
-class ShoonyaApiPy:
-    """Minimal subclass to set Shoonya endpoints."""
-    _api = None
+import requests
+import pandas as pd
 
-    def __init__(self):
-        try:
-            from NorenRestApiPy.NorenApi import NorenApi
-            class _Inner(NorenApi):
-                def __init__(self):
-                    NorenApi.__init__(
-                        self,
-                        host="https://api.shoonya.com/NorenWClientTP/",
-                        websocket="wss://api.shoonya.com/NorenWSTP/",
-                    )
-            self._api = _Inner()
-        except ImportError:
-            raise ImportError(
-                "NorenRestApiPy not installed.\n"
-                "Run: pip install NorenRestApiPy pyotp"
-            )
-
-    # ── Delegate everything to inner api ─────────────────────────
-    def __getattr__(self, name):
-        return getattr(self._api, name)
-
-
-# ── Module-level singleton ────────────────────────────────────────
-_api:     Optional[ShoonyaApiPy] = None
-_lock     = threading.Lock()
-_logged_in = False
+# ── Locate and import official ShoonyaApiPy ──────────────────────
+def _make_api():
+    here  = os.path.dirname(os.path.abspath(__file__))
+    proj  = os.path.join(here, "..")
+    paths = [
+        "/content/ShoonyaApi-py",
+        os.path.join(proj, "ShoonyaApi-py"),
+        os.path.join(proj, "..", "ShoonyaApi-py"),
+        os.path.expanduser("~/ShoonyaApi-py"),
+    ]
+    for p in paths:
+        if os.path.isdir(p):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+            try:
+                from api_helper import ShoonyaApiPy
+                return ShoonyaApiPy()
+            except ImportError:
+                pass
+    raise ImportError(
+        "ShoonyaApi-py not found.\n"
+        "Run: git clone https://github.com/Shoonya-Dev/ShoonyaApi-py.git"
+    )
 
 
-def get_api() -> ShoonyaApiPy:
-    """Return the logged-in API singleton. Call login() first."""
+# ── Module singletons ─────────────────────────────────────────────
+_api:       Optional[object] = None
+_lock       = threading.Lock()
+_logged_in  = False
+
+# Symbol master cache: DataFrame of NFO option symbols
+_sym_master: Optional[pd.DataFrame] = None
+_sym_loaded_date: Optional[date]    = None
+
+NFO_MASTER_URL = "https://api.shoonya.com/NFO_symbols.txt.zip"
+
+_INDEX_TOKENS = {
+    "NIFTY":     "26000",
+    "BANKNIFTY": "26009",
+    "FINNIFTY":  "26037",
+}
+
+
+def get_api():
     if _api is None:
-        raise RuntimeError("Shoonya not logged in — call login() first")
+        raise RuntimeError("Not logged in — call login() first")
     return _api
 
 
+# ── Login ─────────────────────────────────────────────────────────
 def login() -> bool:
-    """
-    Login to Shoonya using credentials from credentials.py.
-    Generates TOTP automatically from the secret key.
-    Returns True on success.
-    """
     global _api, _logged_in
-
     try:
         import credentials as creds
     except ImportError:
         raise FileNotFoundError(
             "credentials.py not found!\n"
-            "Copy credentials_template.py → credentials.py and fill in your details."
+            "Copy credentials_template.py → credentials.py"
         )
-
-    try:
-        import pyotp
-    except ImportError:
-        raise ImportError("pyotp not installed. Run: pip install pyotp")
-
-    # Generate current TOTP from secret key
-    totp = pyotp.TOTP(creds.SHOONYA_TOTP_KEY)
-    current_totp = totp.now()
-
-    # Hash the password (Shoonya expects SHA-256)
-    pwd_hash = hashlib.sha256(creds.SHOONYA_PASSWORD.encode()).hexdigest()
+    import pyotp
+    totp = pyotp.TOTP(creds.SHOONYA_TOTP_KEY).now()
 
     with _lock:
-        _api = ShoonyaApiPy()
+        _api = _make_api()
         ret  = _api.login(
             userid      = creds.SHOONYA_USER_ID,
-            password    = pwd_hash,
-            twoFA       = current_totp,
+            password    = creds.SHOONYA_PASSWORD,   # ShoonyaApiPy hashes internally
+            twoFA       = totp,
             vendor_code = creds.SHOONYA_VENDOR_CODE,
             api_secret  = creds.SHOONYA_API_SECRET,
             imei        = creds.SHOONYA_IMEI,
@@ -96,193 +92,309 @@ def login() -> bool:
         return True
     else:
         err = ret.get("emsg", str(ret)) if ret else "no response"
-        print(f"  Shoonya login FAILED: {err}")
-        return False
+        raise RuntimeError(
+            f"Shoonya login failed: {err}\n"
+            "Make sure TOTP_KEY is the secret key, not the 6-digit code."
+        )
 
 
-# ── Index spot tokens (NSE exchange) ─────────────────────────────
-_INDEX_TOKENS = {
-    "NIFTY":     "26000",   # NIFTY 50
-    "BANKNIFTY": "26009",   # NIFTY BANK
-    "FINNIFTY":  "26037",   # NIFTY FIN SERVICE
-}
-
+# ── Spot price ────────────────────────────────────────────────────
 def get_spot(symbol: str) -> Optional[float]:
-    """Get current spot price for index from NSE exchange."""
     token = _INDEX_TOKENS.get(symbol.upper())
     if not token:
         return None
     try:
-        api = get_api()
-        ret = api.get_quotes(exchange="NSE", token=token)
-        if ret and ret.get("stat") == "Ok":
-            return float(ret.get("lp", 0))
+        q = get_api().get_quotes(exchange="NSE", token=token)
+        if q and q.get("stat") == "Ok":
+            return float(q.get("lp", 0))
     except Exception as e:
-        print(f"  get_spot({symbol}) error: {e}")
+        print(f"  get_spot error: {e}")
     return None
 
 
-def _parse_expiry(tsym: str, symbol: str) -> str:
-    """
-    Parse expiry date string from Shoonya tsym.
-    Format: NIFTY25MAR24000CE  →  "27-Mar-2025"
-    Returns DD-Mon-YYYY string matching NSE format used by build_df().
-    """
-    # Strip symbol prefix
-    rest = tsym[len(symbol):]           # "25MAR24000CE"
-    yy   = rest[:2]                     # "25"
-    mon  = rest[2:5]                    # "MAR"
-    year = f"20{yy}"                    # "2025"
-
-    mon_map = {
-        "JAN":"01","FEB":"02","MAR":"03","APR":"04",
-        "MAY":"05","JUN":"06","JUL":"07","AUG":"08",
-        "SEP":"09","OCT":"10","NOV":"11","DEC":"12"
-    }
-    mon_num = mon_map.get(mon.upper(), "01")
-
-    # Find last Thursday of the month as expiry (NSE standard)
-    # But simpler: use what Shoonya returns in 'exd' field if available
-    # This fallback uses 1st of month as placeholder — overridden by exd field
-    return f"01-{mon[:1].upper()}{mon[1:].lower()}-{year}"
-
-
-def _parse_expiry_from_exd(exd: str) -> str:
-    """
-    Convert Shoonya exd field (DD-MM-YYYY) to NSE format (DD-Mon-YYYY).
-    e.g. "27-03-2025" → "27-Mar-2025"
-    """
-    if not exd:
-        return ""
+# ── VIX ───────────────────────────────────────────────────────────
+def get_vix() -> Optional[float]:
     try:
-        dt = datetime.strptime(exd, "%d-%m-%Y")
-        return dt.strftime("%d-%b-%Y")   # "27-Mar-2025"
+        q = get_api().get_quotes(exchange="NSE", token="26017")
+        if q and q.get("stat") == "Ok":
+            return float(q.get("lp", 0))
+    except Exception as e:
+        print(f"  get_vix error: {e}")
+    return None
+
+
+# ── Symbol Master ─────────────────────────────────────────────────
+def _load_symbol_master() -> pd.DataFrame:
+    """
+    Download and cache NFO symbol master from Shoonya.
+    Returns DataFrame with columns: Token, TradingSymbol, Instrument,
+    Symbol, Expiry, StrikePrice, OptionType, LotSize.
+    Re-downloads once per day.
+    """
+    global _sym_master, _sym_loaded_date
+    today = date.today()
+
+    if _sym_master is not None and _sym_loaded_date == today:
+        return _sym_master
+
+    print("  Downloading NFO symbol master …", end=" ", flush=True)
+    try:
+        r = requests.get(NFO_MASTER_URL, timeout=30)
+        r.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            fname = z.namelist()[0]
+            with z.open(fname) as f:
+                df = pd.read_csv(f, header=None)
+    except Exception as e:
+        print(f"FAILED: {e}")
+        return pd.DataFrame()
+
+    # Column layout per Shoonya docs:
+    # 0=Exchange, 1=Token, 2=LotSize, 3=Symbol, 4=TradingSymbol,
+    # 5=Expiry(DD-Mon-YYYY), 6=Instrument, 7=TickSize,
+    # 8=StrikePrice, 9=OptionType, 10=PricePrecision
+    df.columns = (list(df.columns[:11]) + list(range(11, len(df.columns))))
+    col_map = {
+        0: "Exchange", 1: "Token", 2: "LotSize", 3: "Symbol",
+        4: "TradingSymbol", 5: "Expiry", 6: "Instrument",
+        7: "TickSize", 8: "StrikePrice", 9: "OptionType",
+    }
+    df.rename(columns=col_map, inplace=True)
+
+    # Keep NFO options only
+    df = df[df["Exchange"] == "NFO"].copy()
+    df = df[df["Instrument"].isin(["OPTIDX", "OPTSTK"])].copy()
+    df["StrikePrice"] = pd.to_numeric(df["StrikePrice"], errors="coerce")
+    df["Token"]       = df["Token"].astype(str)
+
+    _sym_master     = df
+    _sym_loaded_date = today
+    print(f"OK — {len(df):,} NFO option contracts loaded")
+    return df
+
+
+def _nearest_expiry(symbol: str, df: pd.DataFrame) -> str:
+    """Return the nearest upcoming expiry date string for symbol."""
+    today_str = date.today().isoformat()
+    rows = df[df["Symbol"] == symbol].copy()
+    if rows.empty:
+        return ""
+    # Shoonya expiry format varies: "27-Mar-2025" or "27-MAR-2025"
+    # Normalise to title-case for strptime then keep original string
+    rows["_exp_dt"] = pd.to_datetime(
+        rows["Expiry"].str.title(), format="%d-%b-%Y", errors="coerce"
+    )
+    future = rows[rows["_exp_dt"] >= pd.Timestamp(today_str)]
+    if future.empty:
+        return ""
+    nearest = future["_exp_dt"].min()
+    return rows[rows["_exp_dt"] == nearest]["Expiry"].iloc[0]
+
+
+def _get_option_tokens(symbol: str, expiry: str, atm: float,
+                       num_strikes: int) -> pd.DataFrame:
+    """
+    From symbol master, return token rows for ±num_strikes around ATM.
+    Returns DataFrame with Token, TradingSymbol, StrikePrice, OptionType.
+    """
+    df  = _load_symbol_master()
+    sub = df[(df["Symbol"] == symbol) & (df["Expiry"] == expiry)].copy()
+    if sub.empty:
+        return pd.DataFrame()
+
+    # Sort strikes, keep ±num_strikes around ATM
+    strikes = sorted(sub["StrikePrice"].dropna().unique())
+    if not strikes:
+        return pd.DataFrame()
+    atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - atm))
+    lo  = max(0, atm_idx - num_strikes)
+    hi  = min(len(strikes), atm_idx + num_strikes + 1)
+    sel = strikes[lo:hi]
+
+    return sub[sub["StrikePrice"].isin(sel)][
+        ["Token", "TradingSymbol", "StrikePrice", "OptionType", "Expiry", "LotSize"]
+    ].copy()
+
+
+# ── Black-Scholes IV fallback ─────────────────────────────────────
+def _bs_iv(ltp: float, spot: float, strike: float, tte: float,
+           opt_type: str, r: float = 0.065) -> float:
+    """
+    Compute implied volatility via bisection on Black-Scholes.
+    Used when Shoonya returns iv=0.
+
+    ltp      : option last traded price
+    spot     : underlying spot price
+    strike   : option strike price
+    tte      : time to expiry in years (e.g. 7/365)
+    opt_type : "CE" or "PE"
+    r        : risk-free rate (Indian 91-day T-bill ~6.5%)
+
+    Returns IV in percent (e.g. 14.5 for 14.5%), or 0.0 on failure.
+    """
+    import math
+    if ltp <= 0 or spot <= 0 or strike <= 0 or tte <= 0:
+        return 0.0
+
+    def _bs_price(vol):
+        try:
+            d1 = (math.log(spot / strike) + (r + 0.5 * vol**2) * tte) / (vol * math.sqrt(tte))
+            d2 = d1 - vol * math.sqrt(tte)
+            # Standard normal CDF approximation
+            def _norm_cdf(x):
+                return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+            if opt_type == "CE":
+                return spot * _norm_cdf(d1) - strike * math.exp(-r * tte) * _norm_cdf(d2)
+            else:
+                return strike * math.exp(-r * tte) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+        except Exception:
+            return 0.0
+
+    # Bisection search: IV between 1% and 200%
+    lo, hi = 0.01, 2.0
+    for _ in range(50):
+        mid   = (lo + hi) / 2
+        price = _bs_price(mid)
+        if price < ltp:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 0.0001:
+            break
+
+    iv = round(((lo + hi) / 2) * 100, 2)
+    # Sanity: IV outside 2–150% is noise
+    return iv if 2.0 <= iv <= 150.0 else 0.0
+
+
+def _days_to_expiry(expiry_str: str) -> float:
+    """
+    Convert expiry string (e.g. '10-MAR-2026') to fraction of year.
+    Returns minimum 1/365 to avoid division by zero on expiry day.
+    """
+    from datetime import date
+    try:
+        exp = datetime.strptime(expiry_str.title(), "%d-%b-%Y").date()
+        days = max(1, (exp - date.today()).days)
+        return days / 365.0
     except Exception:
-        return exd
+        return 7 / 365.0
 
 
+# ── Main fetch: option chain ──────────────────────────────────────
 def fetch_option_chain(symbol: str, spot: float, num_strikes: int = 20) -> dict:
     """
-    Fetch full option chain from Shoonya and normalise to NSE format.
-
-    Returns dict matching NSE option-chain-indices structure:
-    {
-        "records": {
-            "underlyingValue": 24865.0,
-            "expiryDates": ["27-Mar-2025", ...],
-            "timestamp": "04-Mar-2025 10:15:00",
-            "data": [
-                {
-                    "strikePrice": 24000.0,
-                    "expiryDate":  "27-Mar-2025",
-                    "CE": {"openInterest":..., "changeinOpenInterest":...,
-                           "lastPrice":..., "totalTradedVolume":...,
-                           "impliedVolatility":...},
-                    "PE": {...}
-                }, ...
-            ]
-        }
-    }
+    Build option chain using symbol master + batch get_quotes.
+    Returns NSE-format dict compatible with the rest of the dashboard.
     """
     api    = get_api()
     symbol = symbol.upper()
+    step   = 50 if symbol == "NIFTY" else (100 if symbol == "BANKNIFTY" else 50)
+    atm    = round(spot / step) * step
 
-    # Step 1: get option chain symbol list around ATM strike
-    step    = 50 if symbol == "NIFTY" else 100
-    atm     = round(spot / step) * step
-
-    ret = api.get_option_chain(
-        exchange       = "NFO",
-        tradingsymbol  = symbol,
-        strikeprice    = str(int(atm)),
-        count          = str(num_strikes),
-    )
-
-    if not ret or ret.get("stat") != "Ok":
-        err = ret.get("emsg", str(ret)) if ret else "no response"
-        print(f"  get_option_chain failed: {err}")
+    # Load symbol master and find nearest expiry
+    master  = _load_symbol_master()
+    if master.empty:
+        print("  Symbol master unavailable")
         return {}
 
-    values = ret.get("values", [])
-    if not values:
-        print("  get_option_chain: empty values")
+    expiry = _nearest_expiry(symbol, master)
+    if not expiry:
+        print(f"  No expiry found for {symbol}")
         return {}
 
-    # Step 2: group by (strike, expiry) → {CE: token, PE: token}
-    # Build a map: strike → {expiry, ce_token, pe_token}
-    strike_map: dict = {}
-    expiry_set: set  = set()
+    print(f"  Using expiry: {expiry}")
 
-    for v in values:
-        tsym   = v.get("tsym", "")
-        optt   = v.get("optt", "")        # "CE" or "PE"
-        token  = v.get("token", "")
-        strprc = float(v.get("strprc", 0))
-        exd    = _parse_expiry_from_exd(v.get("exd", ""))
+    # Get option tokens around ATM
+    tokens_df = _get_option_tokens(symbol, expiry, atm, num_strikes)
+    if tokens_df.empty:
+        print(f"  No option tokens found for {symbol} {expiry}")
+        return {}
 
-        if not exd:
-            # Fallback: parse from tsym
-            exd = _parse_expiry(tsym, symbol)
+    print(f"  Fetching quotes for {len(tokens_df)} contracts …", end=" ", flush=True)
 
-        expiry_set.add(exd)
-        key = (strprc, exd)
-        if key not in strike_map:
-            strike_map[key] = {"strike": strprc, "expiry": exd,
-                               "ce_token": None, "pe_token": None}
-        if optt == "CE":
-            strike_map[key]["ce_token"] = token
-        elif optt == "PE":
-            strike_map[key]["pe_token"] = token
-
-    # Step 3: fetch quotes for every token
-    # Build token→quote map in one pass to avoid duplicate calls
-    all_tokens = {}
-    for info in strike_map.values():
-        if info["ce_token"]: all_tokens[info["ce_token"]] = None
-        if info["pe_token"]: all_tokens[info["pe_token"]] = None
-
-    for token in all_tokens:
+    # Batch get_quotes for each token
+    import re as _re
+    quote_map: dict = {}
+    for _, row in tokens_df.iterrows():
+        token = str(row["Token"])
         try:
             q = api.get_quotes(exchange="NFO", token=token)
-            all_tokens[token] = q if (q and q.get("stat") == "Ok") else {}
-            time.sleep(0.05)   # small delay to avoid rate limits
+            quote_map[token] = q if (q and q.get("stat") == "Ok") else {}
+            time.sleep(0.04)   # ~25 req/s — within Shoonya limits
         except Exception as e:
-            print(f"  get_quotes token={token} error: {e}")
-            all_tokens[token] = {}
+            quote_map[token] = {}
 
-    # Step 4: assemble NSE-format data list
-    data_items = []
-    for (strike, expiry), info in sorted(strike_map.items()):
-        ce_q = all_tokens.get(info["ce_token"], {})
-        pe_q = all_tokens.get(info["pe_token"], {})
+    iv_computed = 0
+    tte = _days_to_expiry(expiry)
+    print(f"done ({len(quote_map)} quotes, tte={tte*365:.0f}d)")
 
-        def _int(q, k):   return int(float(q.get(k, 0) or 0))
-        def _float(q, k): return float(q.get(k, 0) or 0)
+    # Build NSE-format data list
+    from collections import defaultdict
+    strike_data: dict = defaultdict(lambda: {"CE": {}, "PE": {}})
 
-        data_items.append({
+    for _, row in tokens_df.iterrows():
+        token  = str(row["Token"])
+        strike = float(row["StrikePrice"])
+        tsym   = str(row["TradingSymbol"])
+        # Parse CE/PE from trading symbol — e.g. NIFTY10MAR26P24250 → "PE"
+        optype = ""
+        for char, label in (("C", "CE"), ("P", "PE")):
+            if _re.search(rf"{char}\d", tsym):
+                optype = label
+                break
+        if not optype:
+            continue
+
+        q   = quote_map.get(token, {})
+        ltp = float(q.get("lp") or 0)
+
+        # Get IV — use Shoonya's value, fall back to Black-Scholes if 0
+        shoonya_iv = float(q.get("iv") or 0)
+        if shoonya_iv > 0:
+            iv_val = shoonya_iv
+        elif ltp > 0:
+            iv_val = _bs_iv(ltp, spot, strike, tte, optype)
+            if iv_val > 0:
+                iv_computed += 1
+        else:
+            iv_val = 0.0
+
+        strike_data[strike][optype] = {
+            "openInterest":         int(float(q.get("oi") or 0)),
+            "changeinOpenInterest": int(float(q.get("daychngoi") or 0)),
+            "lastPrice":            ltp,
+            "totalTradedVolume":    int(float(q.get("v") or 0)),
+            "impliedVolatility":    iv_val,
+        }
+
+    if iv_computed > 0:
+        print(f"  IV: {iv_computed} strikes computed via Black-Scholes fallback")
+
+    data_items = [
+        {
             "strikePrice": strike,
             "expiryDate":  expiry,
-            "CE": {
-                "openInterest":        _int(ce_q,   "oi"),
-                "changeinOpenInterest": _int(ce_q,   "daychngoi"),
-                "lastPrice":           _float(ce_q,  "lp"),
-                "totalTradedVolume":   _int(ce_q,   "v"),
-                "impliedVolatility":   _float(ce_q,  "iv"),
-            },
-            "PE": {
-                "openInterest":        _int(pe_q,   "oi"),
-                "changeinOpenInterest": _int(pe_q,   "daychngoi"),
-                "lastPrice":           _float(pe_q,  "lp"),
-                "totalTradedVolume":   _int(pe_q,   "v"),
-                "impliedVolatility":   _float(pe_q,  "iv"),
-            },
-        })
-
-    expiry_list = sorted(expiry_set, key=lambda d: datetime.strptime(d, "%d-%b-%Y"))
+            "CE": strike_data[strike].get("CE", {}),
+            "PE": strike_data[strike].get("PE", {}),
+        }
+        for strike in sorted(strike_data)
+    ]
 
     return {"records": {
         "underlyingValue": spot,
         "timestamp":       datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
-        "expiryDates":     expiry_list,
+        "expiryDates":     [expiry],
         "data":            data_items,
     }}
+
+
+# ── Expiry helpers ────────────────────────────────────────────────
+def _parse_expiry_from_exd(exd: str) -> str:
+    """Convert DD-MM-YYYY → DD-Mon-YYYY."""
+    if not exd:
+        return ""
+    try:
+        return datetime.strptime(exd, "%d-%m-%Y").strftime("%d-%b-%Y")
+    except Exception:
+        return exd

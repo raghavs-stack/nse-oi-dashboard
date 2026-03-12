@@ -25,6 +25,8 @@ strategy_engine = StrategyEngine()
 from config import PCR_BEARISH as _PB, PCR_BULLISH as _PBu
 pcr_bearish: float = _PB
 pcr_bullish: float = _PBu
+consecutive_bias_cycles: int = 0   # counts how many cycles in a row have same bias
+_last_bias: str = "NEUTRAL"          # previous cycle's bias, for tracking
 
 
 def reset_day():
