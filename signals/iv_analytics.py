@@ -335,10 +335,15 @@ class IVHistory:
         return df
 
     # ── Update with today's closing IV ──────────────────────────
-    def update(self, atm_iv: float, date: datetime = None):
+    def update(self, atm_iv: float, date: datetime = None, vix: float = None):
         """
         Append today's ATM IV to the history (call once at session end).
         Automatically trims to IV_HISTORY_DAYS.
+
+        BUG-12 fix: VIX column previously wrote atm_iv into VIX, corrupting
+        the bootstrap VIX data after the first live session.  VIX is now only
+        written when explicitly supplied (e.g. from fetch_vix at EOD).
+        IVR/IVP calculations use only the ATM_IV column, so this is safe.
         """
         if atm_iv is None or atm_iv <= 0:
             return
@@ -348,11 +353,15 @@ class IVHistory:
             last_date = pd.to_datetime(self.history["Date"].iloc[-1]).date()
             if last_date == dt:
                 self.history.iloc[-1, self.history.columns.get_loc("ATM_IV")] = atm_iv
+                if vix is not None:
+                    self.history.iloc[-1, self.history.columns.get_loc("VIX")] = vix
             else:
-                new_row = pd.DataFrame([{"Date": dt, "ATM_IV": atm_iv, "VIX": atm_iv}])
+                new_row = pd.DataFrame([{"Date": dt, "ATM_IV": atm_iv,
+                                         "VIX": vix if vix is not None else float("nan")}])
                 self.history = pd.concat([self.history, new_row], ignore_index=True)
         else:
-            new_row = pd.DataFrame([{"Date": dt, "ATM_IV": atm_iv, "VIX": atm_iv}])
+            new_row = pd.DataFrame([{"Date": dt, "ATM_IV": atm_iv,
+                                     "VIX": vix if vix is not None else float("nan")}])
             self.history = pd.concat([self.history, new_row], ignore_index=True)
 
         self.history = self.history.tail(IV_HISTORY_DAYS).reset_index(drop=True)

@@ -63,6 +63,14 @@ MIN_TRADE_GAP_MINS_SYMBOL = {
 # Same-bias retake: minimum score required to override the same-direction guard
 SAME_BIAS_OVERRIDE_SCORE = 70   # was 65; stricter to prevent chasing
 
+# Opening-session gate: no trades in the first N minutes after 09:15 IST.
+# BNF lost 3 consecutive trades at 09:30-09:33 due to opening volatility.
+NO_TRADE_BEFORE_MINS  = 20   # gate lifts at 09:35; 0 to disable
+
+# Telegram rate-limiting for informational (not-taken) alerts.
+# Taken signals ALWAYS send immediately; informational alerts are throttled.
+INFO_ALERT_COOLDOWN_MINS = 30  # min gap between score≥70-but-not-taken alerts
+
 # ── Technical indicators (haripm2211 StrategyEngine) ─────────────
 RSI_PERIOD   = 14
 VWAP_WINDOW  = 20

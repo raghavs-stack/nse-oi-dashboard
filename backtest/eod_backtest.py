@@ -10,7 +10,7 @@ import os
 import pandas as pd
 
 import state
-from config import SYMBOL, LOT_SIZE
+from config import SYMBOL
 from core.market_hours import now_ist
 
 
@@ -51,13 +51,17 @@ class Signal:
     ivp:             Optional[float] = None
     iv_skew_pct:     Optional[float] = None
     iv_skew_dir:     str             = "N/A"
+    symbol:          str             = ""   # which index this signal is for
 
 
 def run_eod_backtest(final_spot: float):
     """
     Delta-approximation backtest on today's taken trades.
     Brokerage: ~Rs40 per lot per leg.
+    LOT_SIZE read dynamically so dual-mode BANKNIFTY uses the right lot.
     """
+    import config as _cfg
+    LOT_SIZE = _cfg.LOT_SIZE   # read current value, not import-time snapshot
     taken_sigs   = [s for s in state.signal_log if s.taken]
     skipped_sigs = [s for s in state.signal_log if not s.taken]
 

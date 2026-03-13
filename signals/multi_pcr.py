@@ -2,7 +2,7 @@
 #  signals/multi_pcr.py  v5.7
 #
 #  Weekly PCR  — PCR of nearest weekly expiry contracts only
-#  Monthly PCR — PCR of last-Thursday monthly expiry contracts
+#  Monthly PCR — PCR of last-Tuesday monthly expiry contracts (NSE circular Jun-2025)
 #  PCR Series  — Rolling time series with 20-EMA and VWAP
 #
 #  The Opstra-style insight:
@@ -31,12 +31,16 @@ def _parse_expiry_date(expiry_str: str) -> Optional[date]:
 
 
 def _is_monthly_expiry(d: date) -> bool:
-    """True if d is the last Thursday of its month."""
-    if d.weekday() != 3:  # must be Thursday
+    """True if d is the last Tuesday of its month.
+
+    NSE Circular NSE/FAOP/68747 (Jun 25, 2025): all index/stock derivatives
+    monthly expiry moved from last Thursday → last Tuesday (effective Sep 1, 2025).
+    """
+    if d.weekday() != 1:  # must be Tuesday
         return False
-    # Is there another Thursday in this month?
-    next_thu = d + timedelta(days=7)
-    return next_thu.month != d.month
+    # Is there another Tuesday in this month?
+    next_tue = d + timedelta(days=7)
+    return next_tue.month != d.month
 
 
 def classify_expiries(expiry_dates: list[str]) -> dict:
@@ -116,11 +120,12 @@ class PCRSeries:
     def _ema(self, new_val: float) -> float:
         k = 2 / (self.EMA_PERIOD + 1)
         if self._ema20 is None:
-            if len(self.local) < self.EMA_PERIOD:
-                # Not enough data yet — use SMA
-                self._ema20 = sum(list(self.local)[-self.EMA_PERIOD:]) / len(self.local)
-            else:
-                self._ema20 = sum(list(self.local)[-self.EMA_PERIOD:]) / self.EMA_PERIOD
+            # BUG-11 fix: seed from SMA and return without applying EMA formula again.
+            # Old code applied the formula on top of the seed using the same new_val,
+            # double-weighting the first point.
+            vals = list(self.local)
+            self._ema20 = sum(vals[-self.EMA_PERIOD:]) / min(len(vals), self.EMA_PERIOD)
+            return round(self._ema20, 4)
         self._ema20 = new_val * k + self._ema20 * (1 - k)
         return round(self._ema20, 4)
 

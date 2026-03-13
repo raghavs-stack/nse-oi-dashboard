@@ -31,7 +31,7 @@ from config import (
 from core.market_hours import is_market_open, is_eod, next_open_str, now_ist
 from core.nse_fetcher  import (
     create_session, fetch_chain, fetch_vix,
-    build_df, demo_data, nearest_strike
+    build_df, demo_data, nearest_strike, strike_step
 )
 from signals.indicators  import StrategyEngine
 from signals.oi_analytics import (
@@ -87,6 +87,7 @@ class SymbolEngine:
         self.strategy_engine = StrategyEngine()
         self.eod_done    = False
         self.cycle       = 0
+        self.baseline_oi = {}  # session-start OI per strike for intraday ΔOI chart
 
 
 # ════════════════════════════════════════════════════════════════
@@ -99,17 +100,17 @@ def process_cycle(data: dict, symbol: str, vix: str,
     # Validate response structure before touching any key
     if not isinstance(data, dict) or "records" not in data:
         print(f"process_cycle: bad data shape — keys={list(data.keys()) if isinstance(data,dict) else type(data)}")
-        return None, {}, pd.DataFrame(), {}, {}, {}
+        return None, {}, pd.DataFrame(), {}, {}, {}, {}
 
     rec = data["records"]
     if not isinstance(rec, dict):
         print(f"process_cycle: 'records' is not a dict (type={type(rec)})")
-        return None, {}, pd.DataFrame(), {}, {}, {}
+        return None, {}, pd.DataFrame(), {}, {}, {}, {}
 
     spot = rec.get("underlyingValue")
     if not spot:
         print(f"process_cycle: missing underlyingValue — rec keys={list(rec.keys())}")
-        return None, {}, pd.DataFrame(), {}, {}, {}
+        return None, {}, pd.DataFrame(), {}, {}, {}, {}
     spot = float(spot)
     avail  = rec.get("expiryDates", [])
     expiry = (selected_expiry if selected_expiry and selected_expiry in avail
@@ -118,15 +119,35 @@ def process_cycle(data: dict, symbol: str, vix: str,
     raw_data = rec.get("data", [])
     if not raw_data:
         print("process_cycle: empty data list in records")
-        return None, {}, pd.DataFrame(), {}, {}, {}
+        return None, {}, pd.DataFrame(), {}, {}, {}, {}
 
     df = build_df(raw_data, expiry)
     if df.empty:
-        return None, {}, pd.DataFrame(), {}, {}, {}
+        return None, {}, pd.DataFrame(), {}, {}, {}, {}
+
+    # ── Intraday OI delta from session-start baseline ─────────────
+    # Shoonya's daychngoi (→ CE_Chg) is 0 for most option strikes.
+    # We track a session-start baseline and compute the real intraday delta.
+    _strike_list = df["Strike"].astype(int).tolist()
+    if not state.baseline_oi:
+        # Cycle 1: snapshot current OI as the zero reference.
+        for _s, _ceo, _peo in zip(_strike_list, df["CE_OI"], df["PE_OI"]):
+            state.baseline_oi[_s] = {"CE": _ceo, "PE": _peo}
+        df["CE_Intraday_Chg"] = 0.0
+        df["PE_Intraday_Chg"] = 0.0
+    else:
+        df["CE_Intraday_Chg"] = [
+            row["CE_OI"] - state.baseline_oi.get(int(row["Strike"]), {"CE": row["CE_OI"]})["CE"]
+            for _, row in df.iterrows()
+        ]
+        df["PE_Intraday_Chg"] = [
+            row["PE_OI"] - state.baseline_oi.get(int(row["Strike"]), {"PE": row["PE_OI"]})["PE"]
+            for _, row in df.iterrows()
+        ]
 
     total_ce = df["CE_OI"].sum()
     if total_ce == 0:
-        return None, {}, pd.DataFrame(), {}, {}, {}
+        return None, {}, pd.DataFrame(), {}, {}, {}, {}
     total_pe = df["PE_OI"].sum()
 
     # ── PCR ────────────────────────────────────────────────────
@@ -214,7 +235,7 @@ def process_cycle(data: dict, symbol: str, vix: str,
     rsi_val, vwap_val, tech_signal = state.strategy_engine.on_tick(spot)
 
     from signals.advanced_analytics import run_advanced_analytics
-    adv = run_advanced_analytics(df, spot)
+    adv = run_advanced_analytics(df, spot, symbol=symbol)  # BUG-06: pass symbol for step-aware momentum
     dealer_vote = adv["dealer"]["vote"]
 
     votes = [pcr_bias, score_bias, pain_bias, tech_signal, dealer_vote]
@@ -227,22 +248,11 @@ def process_cycle(data: dict, symbol: str, vix: str,
         state.consecutive_bias_cycles = 1 if bias != "NEUTRAL" else 0
     state._last_bias = bias
 
-    # ── Strategy classifier ───────────────────────────────────
-    strat_class = classify_strategy(
-        bias         = bias,
-        ivr          = hist_summ.get("ivr"),
-        ivp          = hist_summ.get("ivp"),
-        atm_iv       = atm_iv,
-        score        = 0,            # placeholder; updated after score_signal
-        days_to_exp  = day_qual["days_to_weekly"],
-        day_quality  = day_qual["composite_score"],
-        pcr_div_sig  = pcr_data.get("div_signal", "ALIGNED"),
-    )
-
     # ── Recommendations ────────────────────────────────────────
+    # (strategy classifier runs AFTER score is known — removed placeholder call BUG-10)
     recs = recommend_strikes(df, spot, bias, max_pain, resistance, support, symbol)
     if len(recs) < 3:
-        return None, {}, pd.DataFrame(), {}, {}, {}
+        return None, {}, pd.DataFrame(), {}, {}, {}, {}
 
     # ── Signal score ───────────────────────────────────────────
     # pcr_trend_bars: +N if PCR has been rising N cycles (bearish confirm),
@@ -331,8 +341,21 @@ def process_cycle(data: dict, symbol: str, vix: str,
         rsi=rsi_val, vwap=vwap_val, tech_signal=tech_signal,
         atm_iv=atm_iv, ivr=hist_summ.get("ivr"), ivp=hist_summ.get("ivp"),
         iv_skew_pct=iv_skew.get("skew_pct"), iv_skew_dir=iv_skew.get("direction", "N/A"),
+        symbol=symbol,
     )
-    return sig, adv, df, pcr_data, day_qual, strat_class
+    # BUG-01 fix: pack all locals that call sites need into a ctx dict.
+    # Previously these were referenced by name at call sites → NameError.
+    _ctx = {
+        "max_pain":         max_pain,
+        "resistance":       resistance,
+        "support":          support,
+        "weighted_net_score": weighted_net_score,
+        "local_pcr":        local_pcr,
+        "pcr_signal":       pcr_signal,
+        "pcr_signal_color": pcr_signal_color,
+        "roc_alerts":       roc_alerts,       # BUG-07 fix: expose for Telegram
+    }
+    return sig, adv, df, pcr_data, day_qual, strat_class, _ctx
 
 
 # ════════════════════════════════════════════════════════════════
@@ -376,9 +399,58 @@ def _build_iv_chart(df, spot: float) -> dict:
 
 def _write_streamlit_state(sig, adv: dict, df, spot: float, vix: str,
                            pcr_data: dict = None, day_qual: dict = None,
-                           strat_class: dict = None):
+                           strat_class: dict = None,
+                           max_pain: float = 0, resistance: int = 0,
+                           support: int = 0, net_score: int = 0,
+                           local_pcr: float = None, pcr_signal: str = "NEUTRAL",
+                           pcr_signal_color: str = "#f39c12"):
     """Write current cycle state to dashboard_state.json for Streamlit."""
-    atm_df = df[(df["Strike"] >= spot * 0.97) & (df["Strike"] <= spot * 1.03)]
+    from core.nse_fetcher import nearest_strike as _nearest_strike
+    atm_df  = df[(df["Strike"] >= spot * 0.96) & (df["Strike"] <= spot * 1.04)].copy()
+    atm_str = _nearest_strike(spot, config.SYMBOL)
+
+    # Weighted direction for the OI Profile header text
+    if net_score > 0:
+        wtd_dir, wtd_clr = "Bearish (CE buildup)", "#e74c3c"
+    elif net_score < 0:
+        wtd_dir, wtd_clr = "Bullish (PE buildup)", "#2ecc71"
+    else:
+        wtd_dir, wtd_clr = "Neutral", "#f39c12"
+
+    # Build oi_chart with all fields needed to replicate the 3-panel chart
+    oi_chart_data: dict = {}
+    if not atm_df.empty:
+        ce_vol = atm_df["CE_Vol"].tolist() if "CE_Vol" in atm_df.columns else [0]*len(atm_df)
+        oi_chart_data = {
+            "strikes":    atm_df["Strike"].astype(int).tolist(),
+            "ce_oi":      atm_df["CE_OI"].tolist(),
+            "pe_oi":      atm_df["PE_OI"].tolist(),
+            "ce_chg":     (atm_df["CE_Intraday_Chg"].tolist()
+                           if "CE_Intraday_Chg" in atm_df.columns
+                           else atm_df["CE_Chg"].tolist()),
+            "pe_chg":     (atm_df["PE_Intraday_Chg"].tolist()
+                           if "PE_Intraday_Chg" in atm_df.columns
+                           else atm_df["PE_Chg"].tolist()),
+            "ce_vol":     ce_vol,
+            "atm":        int(atm_str),
+            "max_pain":   int(max_pain)   if max_pain   else 0,
+            "resistance": int(resistance) if resistance else 0,
+            "support":    int(support)    if support    else 0,
+            "net_score":  net_score,
+            "wtd_dir":    wtd_dir,
+            "wtd_clr":    wtd_clr,
+            "local_pcr":  round(local_pcr, 3) if local_pcr else None,
+            "pcr_signal": pcr_signal,
+            "pcr_signal_color": pcr_signal_color,
+        }
+
+    # Build iv_chart with skew annotation data
+    iv_chart_data = _build_iv_chart(df, spot)
+    if sig and sig.iv_skew_pct is not None:
+        iv_chart_data["skew_pct"]      = sig.iv_skew_pct
+        iv_chart_data["skew_dir"]      = sig.iv_skew_dir
+        iv_chart_data["atm_iv_val"]    = sig.atm_iv
+
     state_data = {
         "spot":    spot,
         "vix":     vix,
@@ -393,12 +465,8 @@ def _write_streamlit_state(sig, adv: dict, df, spot: float, vix: str,
                       "premium": r.premium, "sl": r.sl, "target": r.target,
                       "reason": r.reason}
                      for r in [sig.rec1, sig.rec2, sig.rec3]] if sig else []),
-        "oi_chart": {
-            "strikes": atm_df["Strike"].astype(int).tolist(),
-            "ce_oi":   atm_df["CE_OI"].tolist(),
-            "pe_oi":   atm_df["PE_OI"].tolist(),
-        } if not atm_df.empty else {},
-        "iv_chart": _build_iv_chart(df, spot),
+        "oi_chart": oi_chart_data,
+        "iv_chart": iv_chart_data,
         "ts":     now_ist().strftime("%H:%M:%S"),
         "symbol": config.SYMBOL,
         "pcr_series":  pcr_data    or {},
@@ -533,13 +601,15 @@ def run_symbol_cycle(eng: "SymbolEngine", vix: str, use_demo: bool) -> None:
     _save_last_t = _state.last_trade_time
     _save_bull   = _state.pcr_bullish
     _save_bear   = _state.pcr_bearish
-    _save_engine = _state.strategy_engine
+    _save_engine   = _state.strategy_engine
+    _save_baseline = _state.baseline_oi
     _state.signal_log          = eng.signal_log
     _state.daily_trades_taken  = eng.trades_today
     _state.last_trade_time     = eng.last_trade_t
     _state.pcr_bullish         = eng.pcr_bullish
     _state.pcr_bearish         = eng.pcr_bearish
     _state.strategy_engine     = eng.strategy_engine
+    _state.baseline_oi         = eng.baseline_oi
 
     try:
         eng.cycle += 1
@@ -553,14 +623,18 @@ def run_symbol_cycle(eng: "SymbolEngine", vix: str, use_demo: bool) -> None:
                 return
 
         result = process_cycle(data, eng.symbol, vix, use_demo, eng.cycle)
-        sig, adv, cycle_df, pcr_data, day_qual, strat_class = result
+        sig, adv, cycle_df, pcr_data, day_qual, strat_class, _ctx = result  # BUG-01
         if sig is None:
             return
 
         _write_streamlit_state(
             sig, adv, cycle_df,
             data["records"]["underlyingValue"], vix,
-            pcr_data=pcr_data, day_qual=day_qual, strat_class=strat_class)
+            pcr_data=pcr_data, day_qual=day_qual, strat_class=strat_class,
+            max_pain=_ctx["max_pain"], resistance=_ctx["resistance"],
+            support=_ctx["support"], net_score=_ctx["weighted_net_score"],
+            local_pcr=_ctx["local_pcr"], pcr_signal=_ctx["pcr_signal"],
+            pcr_signal_color=_ctx["pcr_signal_color"])
 
         # Breakout / Telegram alerts
         brk = adv.get("breakout", {}) if adv else {}
@@ -596,10 +670,11 @@ def run_symbol_cycle(eng: "SymbolEngine", vix: str, use_demo: bool) -> None:
             send_eod_summary(eng.symbol, wins, losses, len(eng.signal_log), final_spot)
 
         # Sync state back to engine
-        eng.trades_today = _state.daily_trades_taken
-        eng.last_trade_t = _state.last_trade_time
-        eng.pcr_bullish  = _state.pcr_bullish
-        eng.pcr_bearish  = _state.pcr_bearish
+        eng.trades_today  = _state.daily_trades_taken
+        eng.last_trade_t  = _state.last_trade_time
+        eng.pcr_bullish   = _state.pcr_bullish
+        eng.pcr_bearish   = _state.pcr_bearish
+        eng.baseline_oi   = _state.baseline_oi
 
     finally:
         # Always restore config and module-level globals
@@ -619,6 +694,7 @@ def run_symbol_cycle(eng: "SymbolEngine", vix: str, use_demo: bool) -> None:
         _state.pcr_bullish        = _save_bull
         _state.pcr_bearish        = _save_bear
         _state.strategy_engine    = _save_engine
+        _state.baseline_oi        = _save_baseline
 
 
 # ════════════════════════════════════════════════════════════════
@@ -686,7 +762,7 @@ def main():
                    not market_open)
 
     print("=" * 68)
-    print(f"  NSE LIVE OI DASHBOARD  v5.6  [{SYMBOL}]")
+    print(f"  NSE LIVE OI DASHBOARD  v5.7  [{SYMBOL}]")
     print(f"  Env: {'Colab' if IN_COLAB else 'Local'}  |  Lot: {LOT_SIZE}  |  Refresh: {REFRESH_RATE}s")
     print(f"  Mode: {'DEMO (markets closed)' if use_demo else 'LIVE'}")
     print(f"  4-vote: PCR + OI Score + Max Pain + RSI/VWAP")
@@ -722,7 +798,7 @@ def main():
                     continue
 
             result = process_cycle(data, SYMBOL, vix, use_demo, cycle)
-            sig, adv, cycle_df, pcr_data, day_qual, strat_class = result
+            sig, adv, cycle_df, pcr_data, day_qual, strat_class, _ctx = result  # BUG-01
             if sig is None:
                 time.sleep(REFRESH_RATE); continue
 
@@ -730,7 +806,14 @@ def main():
             _write_streamlit_state(sig, adv, cycle_df,
                                    data["records"]["underlyingValue"], vix,
                                    pcr_data=pcr_data, day_qual=day_qual,
-                                   strat_class=strat_class)
+                                   strat_class=strat_class,
+                                   max_pain=_ctx["max_pain"],
+                                   resistance=_ctx["resistance"],
+                                   support=_ctx["support"],
+                                   net_score=_ctx["weighted_net_score"],
+                                   local_pcr=_ctx["local_pcr"],
+                                   pcr_signal=_ctx["pcr_signal"],
+                                   pcr_signal_color=_ctx["pcr_signal_color"])
 
             # Breakout alert via Telegram
             brk = adv.get("breakout", {}) if adv else {}
@@ -738,9 +821,10 @@ def main():
                 send_breakout(SYMBOL, data["records"]["underlyingValue"],
                               brk["signal"], brk["resistance"], brk["support"])
 
-            # RoC alert via Telegram
-            if roc_alerts if "roc_alerts" in dir() else False:
-                send_roc_alert(SYMBOL, roc_alerts)
+            # RoC alert via Telegram — BUG-07 fix: use ctx not dir()
+            _roc = _ctx.get("roc_alerts", [])
+            if _roc:
+                send_roc_alert(SYMBOL, _roc)
 
             if sig:
                 state.signal_log.append(sig)

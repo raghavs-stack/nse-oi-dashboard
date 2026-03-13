@@ -210,20 +210,24 @@ def calc_options_flow(df: pd.DataFrame) -> dict:
 
 
 # ── 4. OI Momentum ───────────────────────────────────────────────
-def calc_oi_momentum(df: pd.DataFrame, spot: float, n: int = 3) -> dict:
+def calc_oi_momentum(df: pd.DataFrame, spot: float, n: int = 3,
+                     symbol: str = "NIFTY") -> dict:
     """
     OI Momentum = OI_Change / (OI + 1)  — build rate, not absolute size
 
     High momentum at a strike = fresh aggressive positioning regardless of OI size.
-    Focuses on ±300 pts around ATM for relevance.
+    Focuses on ±6 strikes around ATM for relevance (symbol-aware step).
+    BUG-06 fix: was hardcoded step=50 / range=300 — wrong for BANKNIFTY (step=100).
     """
     if df.empty:
         return {"call_momentum_strikes": [], "put_momentum_strikes": [],
                 "atm_call_mom": 0.0, "atm_put_mom": 0.0}
 
     d = df.copy()
-    atm = round(spot / 50) * 50
-    nearby = d[(d["Strike"] >= atm - 300) & (d["Strike"] <= atm + 300)].copy()
+    _step = 100 if symbol == "BANKNIFTY" else 50
+    atm   = round(spot / _step) * _step
+    _range = _step * 6    # ±6 strikes: 300 for NIFTY, 600 for BANKNIFTY
+    nearby = d[(d["Strike"] >= atm - _range) & (d["Strike"] <= atm + _range)].copy()
 
     if nearby.empty:
         nearby = d.copy()
@@ -315,13 +319,13 @@ def calc_breakout(df: pd.DataFrame, spot: float) -> dict:
 
 
 # ── Composite runner ─────────────────────────────────────────────
-def run_advanced_analytics(df: pd.DataFrame, spot: float) -> dict:
+def run_advanced_analytics(df: pd.DataFrame, spot: float, symbol: str = "NIFTY") -> dict:
     """Run all advanced analytics in one call. Returns combined dict."""
     return {
         "gamma":       calc_gamma_exposure(df, spot),
         "smart_money": calc_smart_money(df),
         "flow":        calc_options_flow(df),
-        "momentum":    calc_oi_momentum(df, spot),
+        "momentum":    calc_oi_momentum(df, spot, symbol=symbol),
         "dealer":      calc_dealer_hedging(df, spot),
         "breakout":    calc_breakout(df, spot),
     }

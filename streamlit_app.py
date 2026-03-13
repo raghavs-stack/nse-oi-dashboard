@@ -111,6 +111,287 @@ def _gauge_html(score: int, label: str, color: str) -> str:
 
 
 # ── IV Skew chart ─────────────────────────────────────────────────
+# ── 3-panel OI + OI Change + IV Skew chart ─────────────────────────────────
+def _three_panel_charts(state: dict):
+    """
+    Replicates the terminal.py matplotlib 3-panel chart inside Streamlit
+    using Plotly.  Panels:
+      Left   — OI Profile (ATM white border, Δ annotations, spot/max_pain/res/sup lines)
+      Middle — OI Change / Fresh Positions (PCR box overlay)
+      Right  — IV Skew Curve (ATM dot, skew annotation box)
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        st.warning("plotly not installed — run `pip install plotly`")
+        return
+
+    oi  = state.get("oi_chart", {})
+    iv  = state.get("iv_chart", {})
+    sym = state.get("symbol", "NIFTY")
+
+    if not oi:
+        st.info("⏳ Waiting for first data cycle…")
+        return
+
+    strikes   = oi.get("strikes",  [])
+    ce_oi     = oi.get("ce_oi",    [])
+    pe_oi     = oi.get("pe_oi",    [])
+    ce_chg    = oi.get("ce_chg",   [0]*len(strikes))
+    pe_chg    = oi.get("pe_chg",   [0]*len(strikes))
+    ce_vol    = oi.get("ce_vol",   [0]*len(strikes))
+    atm       = oi.get("atm",       0)
+    max_pain  = oi.get("max_pain",  0)
+    resistance= oi.get("resistance",0)
+    support_l = oi.get("support",   0)
+    wtd_dir   = oi.get("wtd_dir",   "Neutral")
+    wtd_clr   = oi.get("wtd_clr",   "#f39c12")
+    local_pcr = oi.get("local_pcr")
+    pcr_sig   = oi.get("pcr_signal",  "N/A")
+    pcr_clr   = oi.get("pcr_signal_color", "#f39c12")
+
+    has_iv = bool(iv and iv.get("strikes") and
+                  any(v > 0 for v in iv.get("ce_iv", []) + iv.get("pe_iv", [])))
+    ncols  = 3 if has_iv else 2
+    col_titles = ["Open Interest  (white border=ATM)",
+                  "OI Change / Fresh Positions",
+                  "IV Skew Curve  (v5.3)"][:ncols]
+
+    # Wider OI panel, slightly narrower ΔOI and IV panels
+    _col_w = [0.42, 0.30, 0.28][:ncols] if ncols == 3 else [0.55, 0.45]
+    fig = make_subplots(rows=1, cols=ncols,
+                        subplot_titles=col_titles,
+                        column_widths=_col_w,
+                        horizontal_spacing=0.05)
+
+    # ── Helper: format OI axis labels (1L = 100k) ─────────────────
+    def fmt_L(val):
+        if val >= 1e7:  return f"{val/1e7:.1f}Cr"
+        if val >= 1e5:  return f"{val/1e5:.1f}L"
+        if val >= 1e3:  return f"{val/1e3:.0f}k"
+        return str(int(val))
+
+    # ── Panel 1: OI Profile ───────────────────────────────────────
+    if strikes and ce_oi:
+        max_oi = max(max(ce_oi, default=1), max(pe_oi, default=1), 1)
+
+        # Call OI bars — white border on ATM bar
+        ce_lc = ["white" if s == atm else "#e74c3c" for s in strikes]
+        pe_lc = ["white" if s == atm else "#2ecc71" for s in strikes]
+        ce_lw = [2.5 if s == atm else 0 for s in strikes]
+        pe_lw = [2.5 if s == atm else 0 for s in strikes]
+
+        fig.add_trace(go.Bar(
+            x=strikes, y=ce_oi, name="Call OI",
+            marker=dict(color="#e74c3c", opacity=0.85,
+                        line=dict(color=ce_lc, width=ce_lw)),
+            offsetgroup=0,
+            text=[f"Δ:{v/1000:+.0f}k" for v in ce_chg],
+            textposition="outside", textfont=dict(size=7, color="#aaa"),
+            hovertemplate="Strike: %{x}<br>CE OI: %{y:,.0f}<br>ΔOI: %{text}",
+        ), row=1, col=1)
+
+        fig.add_trace(go.Bar(
+            x=strikes, y=pe_oi, name="Put OI",
+            marker=dict(color="#2ecc71", opacity=0.85,
+                        line=dict(color=pe_lc, width=pe_lw)),
+            offsetgroup=1,
+            text=[f"Δ:{v/1000:+.0f}k" for v in pe_chg],
+            textposition="outside", textfont=dict(size=7, color="#aaa"),
+            hovertemplate="Strike: %{x}<br>PE OI: %{y:,.0f}<br>ΔOI: %{text}",
+        ), row=1, col=1)
+
+        # Vertical reference lines
+        for xval, lclr, lw, ldash, lname in [
+            (state.get("spot",0),  "#3498db", 2,   "dash",  "Spot"),
+            (max_pain,             "#f39c12", 1.5, "dot",   "MaxPain"),
+            (resistance,           "#e74c3c", 1.0, "dot",   "Res(ΔCE)"),
+            (support_l,            "#2ecc71", 1.0, "dot",   "Sup(ΔPE)"),
+        ]:
+            if xval and xval > 0:
+                fig.add_vline(x=xval, line_color=lclr, line_width=lw,
+                              line_dash=ldash, row=1, col=1,
+                              annotation_text=lname,
+                              annotation_position="top",
+                              annotation_font=dict(size=8, color=lclr))
+
+        # "Wtd Direction" annotation box on panel 1
+        fig.add_annotation(
+            text=f"<b>Wtd Direction: {wtd_dir}</b>",
+            xref="x domain", yref="y domain",
+            x=0.5, y=0.96,
+            showarrow=False,
+            font=dict(size=11, color=wtd_clr),
+            bgcolor="#161b22", bordercolor=wtd_clr, borderwidth=1,
+            borderpad=4, opacity=0.9,
+            row=1, col=1,
+        )
+
+    # ── Panel 2: OI Change ────────────────────────────────────────
+    if strikes and ce_chg:
+        cc = ["#e74c3c" if v > 0 else ("#2ecc71" if v < 0 else "#555") for v in ce_chg]
+        pc = ["#2ecc71" if v > 0 else ("#e74c3c" if v < 0 else "#555") for v in pe_chg]
+
+        def _fmt_chg(v):
+            if abs(v) >= 1e5:  return f"{v/1e5:+.1f}L"
+            if abs(v) >= 1e3:  return f"{v/1e3:+.0f}k"
+            return f"{int(v):+d}" if v != 0 else ""
+
+        fig.add_trace(go.Bar(
+            x=strikes, y=ce_chg, name="Call ΔOI",
+            marker=dict(color=cc, opacity=0.85),
+            offsetgroup=0,
+            text=[_fmt_chg(v) for v in ce_chg],
+            textposition="outside", textfont=dict(size=7, color="#aaa"),
+            hovertemplate="Strike: %{x}<br>CE ΔOI: %{y:,.0f}",
+        ), row=1, col=2)
+
+        fig.add_trace(go.Bar(
+            x=strikes, y=pe_chg, name="Put ΔOI",
+            marker=dict(color=pc, opacity=0.85),
+            offsetgroup=1,
+            text=[_fmt_chg(v) for v in pe_chg],
+            textposition="outside", textfont=dict(size=7, color="#aaa"),
+            hovertemplate="Strike: %{x}<br>PE ΔOI: %{y:,.0f}",
+        ), row=1, col=2)
+
+        # Horizontal zero line + spot line
+        fig.add_hline(y=0, line_color="white", line_width=0.6, row=1, col=2)
+        if state.get("spot"):
+            fig.add_vline(x=state["spot"], line_color="#3498db",
+                          line_width=2, line_dash="dash", row=1, col=2)
+
+        # PCR / Signal annotation box
+        pcr_txt = f"{local_pcr:.3f}" if local_pcr else "N/A"
+        fig.add_annotation(
+            text=f"<b>Local PCR: {pcr_txt}<br>SIGNAL: {pcr_sig}</b>",
+            xref="x2 domain", yref="y2 domain",
+            x=0.04, y=0.97,
+            showarrow=False,
+            font=dict(size=10, color="white"),
+            bgcolor=pcr_clr, bordercolor=pcr_clr, borderwidth=1,
+            borderpad=5, opacity=0.85,
+            align="left",
+            row=1, col=2,
+        )
+
+    # ── Panel 3: IV Skew Curve ────────────────────────────────────
+    if has_iv:
+        iv_strikes = iv.get("strikes", [])
+        ce_iv_v    = iv.get("ce_iv",   [])
+        pe_iv_v    = iv.get("pe_iv",   [])
+        iv_atm     = iv.get("atm",      0)
+
+        fig.add_trace(go.Scatter(
+            x=iv_strikes, y=ce_iv_v, name="Call IV",
+            mode="lines+markers",
+            line=dict(color="#e74c3c", width=2),
+            marker=dict(size=4),
+            hovertemplate="Strike: %{x}<br>Call IV: %{y:.2f}%",
+        ), row=1, col=3)
+
+        fig.add_trace(go.Scatter(
+            x=iv_strikes, y=pe_iv_v, name="Put IV",
+            mode="lines+markers",
+            line=dict(color="#2ecc71", width=2),
+            marker=dict(size=4),
+            hovertemplate="Strike: %{x}<br>Put IV: %{y:.2f}%",
+        ), row=1, col=3)
+
+        # ATM white dot
+        if iv_atm and iv_atm in iv_strikes:
+            atm_idx  = iv_strikes.index(iv_atm)
+            atm_iv_v = (ce_iv_v[atm_idx] + pe_iv_v[atm_idx]) / 2 if atm_idx < len(ce_iv_v) else 0
+            if atm_iv_v > 0:
+                fig.add_trace(go.Scatter(
+                    x=[iv_atm], y=[atm_iv_v],
+                    mode="markers",
+                    marker=dict(color="white", size=10, line=dict(color="white", width=2)),
+                    name=f"ATM IV {atm_iv_v:.2f}%",
+                    showlegend=True,
+                ), row=1, col=3)
+                fig.add_vline(x=iv_atm, line_color="white", line_width=1.2,
+                              line_dash="dash", opacity=0.5, row=1, col=3)
+
+        # Skew annotation box
+        skew_pct = iv.get("skew_pct")
+        skew_dir = iv.get("skew_dir", "N/A")
+        atm_iv_display = iv.get("atm_iv_val")
+        # Derive OTM put/call IV from the extremes of the chain
+        otm_put_iv = otm_call_iv = None
+        if iv_strikes and ce_iv_v and pe_iv_v:
+            otm_put_iv  = round(pe_iv_v[0],  2)  # lowest strike = deepest OTM put
+            otm_call_iv = round(ce_iv_v[-1], 2)  # highest strike = deepest OTM call
+        if skew_pct is not None:
+            slines = [
+                f"IV Skew: {skew_pct:+.2f}%",
+                f"{skew_dir}",
+            ]
+            if otm_put_iv:  slines.append(f"OTM Put IV: {otm_put_iv}")
+            if otm_call_iv: slines.append(f"OTM Call IV: {otm_call_iv}")
+            fig.add_annotation(
+                text="<br>".join(slines),
+                xref="x3 domain", yref="y3 domain",
+                x=0.04, y=0.97,
+                showarrow=False,
+                font=dict(size=9, color="white"),
+                bgcolor="#8b6914", bordercolor="#f0a500",
+                borderpad=5, borderwidth=1, opacity=0.85,
+                align="left",
+                row=1, col=3,
+            )
+
+    # ── Global layout ─────────────────────────────────────────────
+    layout_kw = dict(
+        barmode="group",
+        plot_bgcolor="#161b22", paper_bgcolor="#0d1117",
+        font=dict(color="#e6edf3", size=11),
+        showlegend=True,
+        legend=dict(bgcolor="#161b22", bordercolor="#30363d",
+                    borderwidth=1, font=dict(size=9),
+                    orientation="v", x=1.01, y=1),
+        height=520,          # taller default; autosize fills fullscreen
+        autosize=True,       # Plotly.js recalculates on container resize
+        margin=dict(l=45, r=10, t=55, b=45),
+    )
+    # Per-axis dark styling
+    for i in range(1, ncols + 1):
+        layout_kw[f"xaxis{'' if i==1 else i}"] = dict(
+            tickformat=",d", gridcolor="#21262d",
+            tickfont=dict(size=9), title="Strike",
+        )
+        layout_kw[f"yaxis{'' if i==1 else i}"] = dict(
+            gridcolor="#21262d",
+            tickfont=dict(size=9),
+        )
+    # Format panel 1 y-axis in L notation
+    layout_kw["yaxis"] = dict(
+        gridcolor="#21262d", tickfont=dict(size=9), title="OI",
+        tickformat=",.0s",
+    )
+    layout_kw["yaxis2"] = dict(
+        gridcolor="#21262d", tickfont=dict(size=9), title="ΔOI",
+    )
+    if has_iv:
+        layout_kw["yaxis3"] = dict(
+            gridcolor="#21262d", tickfont=dict(size=9), title="IV (%)",
+            rangemode="tozero",
+        )
+    fig.update_layout(**layout_kw)
+    # Style subplot titles
+    for ann in fig.layout.annotations:
+        if ann.text in col_titles:
+            ann.font = dict(color="white", size=13)
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"responsive": True, "displayModeBar": True,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
+    )
+
+
 def _iv_chart(iv_state: dict):
     st.markdown("##### 📈 IV Skew Curve")
     if not iv_state or iv_state.get("no_data"):
@@ -640,42 +921,9 @@ def render_symbol(symbol: str):
                 st.caption(f"SL: ₹{r.get('sl',0):.0f}  Target: ₹{r.get('target',0):.0f}")
                 st.caption(r.get("reason",""))
 
-    # ── Charts: OI + IV side by side ─────────────────────────────
+    # ── Charts: 3-panel (OI Profile | OI Change | IV Skew) ───────
     st.markdown("---")
-    ch1, ch2 = st.columns(2)
-    with ch1:
-        st.markdown("##### 📊 Open Interest Profile")
-        oi_state = state.get("oi_chart", {})
-        if oi_state:
-            df_oi = pd.DataFrame({
-                "Strike":  oi_state.get("strikes",[]),
-                "Call OI": oi_state.get("ce_oi",  []),
-                "Put OI":  oi_state.get("pe_oi",  []),
-            }).set_index("Strike")
-            if not df_oi.empty:
-                try:
-                    import plotly.graph_objects as go
-                    fig = go.Figure()
-                    strikes = list(df_oi.index)
-                    fig.add_trace(go.Bar(x=strikes, y=df_oi["Call OI"].tolist(),
-                                         name="Call OI", marker_color="#e74c3c"))
-                    fig.add_trace(go.Bar(x=strikes, y=df_oi["Put OI"].tolist(),
-                                         name="Put OI",  marker_color="#2ecc71"))
-                    fig.update_layout(
-                        barmode="group", plot_bgcolor="#0d1117", paper_bgcolor="#0d1117",
-                        font=dict(color="#e6edf3"),
-                        xaxis=dict(tickformat=",d", gridcolor="#21262d"),
-                        yaxis=dict(gridcolor="#21262d"),
-                        legend=dict(bgcolor="#161b22"),
-                        height=280, margin=dict(l=30,r=10,t=10,b=30),
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                except ImportError:
-                    st.bar_chart(df_oi, color=["#e74c3c","#2ecc71"])
-        else:
-            st.info("Waiting for first cycle…")
-    with ch2:
-        _iv_chart(state.get("iv_chart", {}))
+    _three_panel_charts(state)
 
     # ── PCR chart with EMA/VWAP/Weekly/Monthly ────────────────────
     st.markdown("---")

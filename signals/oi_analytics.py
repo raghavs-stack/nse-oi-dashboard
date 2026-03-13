@@ -15,6 +15,7 @@ from config import (
     ROC_THRESHOLD, ROC_THRESHOLD_SYMBOL, REFRESH_RATE,
     MAX_TRADES_PER_DAY, MIN_SIGNAL_SCORE, MIN_TRADE_GAP_MINS,
     MAX_TRADES_PER_DAY_SYMBOL, MIN_TRADE_GAP_MINS_SYMBOL, SAME_BIAS_OVERRIDE_SCORE,
+    NO_TRADE_BEFORE_MINS,
     LOT_SIZE,
 )
 
@@ -124,16 +125,17 @@ def compute_roc_alerts(data_items: list, expiry: str) -> list[str]:
 #  Signal Scorer  (8 factors, 0–100 pts)
 # ────────────────────────────────────────────────────────────────
 #  Factor                              Max pts
-#  1  Bias unanimity (all 4 agree)       20
-#  2  PCR extremity (dist from 1.0)      15
+#  1  Bias unanimity (proportional)      20
+#  2  PCR extremity + trend bonus        20  (15 base + 5 trend bonus)
 #  3  Net OI score magnitude             15
-#  4  Max pain alignment                 10
-#  5  VIX zone (12-18 ideal)             10
+#  4  Max pain proximity                 10
+#  5  VIX zone                           10
 #  6  Time of day                        10
 #  7  RoC confirmation                    5
 #  8  RSI+VWAP confirmation              15
+#  9  Trend persistence (consecutive)    10
 #  ─────────────────────────────────────────
-#  Total                                100
+#  Raw max                              115  → capped at 100 by min(100,sum)
 def score_signal(bias, votes, pcr, net_score, spot, max_pain,
                  vix_str, roc_alerts, tech_signal="NEUTRAL",
                  dealer_vote="NEUTRAL", pcr_trend_bars: int = 0) -> tuple:
@@ -227,13 +229,37 @@ def should_take_trade(score: int, bias: str, spot: float = 0) -> tuple[bool, str
     sb_score = SAME_BIAS_OVERRIDE_SCORE
 
     if state.daily_trades_taken >= max_cap:
-        return False, f"Daily cap reached ({max_cap}/{max_cap})"
+        return False, f"Daily cap reached ({state.daily_trades_taken}/{max_cap})"
     if score < MIN_SIGNAL_SCORE:
         return False, f"Score {score}/100 < min {MIN_SIGNAL_SCORE}"
 
-    # Check time gap — skip for bias reversals (new direction = new opportunity)
+    # Opening-session gate — no trades in the first N minutes after market open.
+    # Early-morning volatility (09:15-09:35) produces noisy signals.
+    if NO_TRADE_BEFORE_MINS > 0:
+        from core.market_hours import now_ist as _now_ist
+        from datetime import timedelta as _td
+        _n = _now_ist()
+        if _n.weekday() < 5:   # weekday only (demo runs outside market hours)
+            _gate = _n.replace(hour=9, minute=15, second=0, microsecond=0) \
+                    + _td(minutes=NO_TRADE_BEFORE_MINS)
+            if _n < _gate:
+                return False, (
+                    f"Opening gate: no trades before "
+                    f"{_gate.strftime('%H:%M')} IST "
+                    f"({NO_TRADE_BEFORE_MINS}min noise filter)"
+                )
+
+    # Check time gap — only skip for genuine directional reversals.
+    # NEUTRAL is not a direction: NEUTRAL↔BULLISH/BEARISH is NOT a reversal.
+    # Only BULLISH→BEARISH or BEARISH→BULLISH bypasses the gap.
     taken_log = [s for s in state.signal_log if s.taken]
-    is_reversal = bool(taken_log) and taken_log[-1].bias != bias
+    _DIRECTIONAL = {"BULLISH", "BEARISH"}
+    is_reversal = (
+        bool(taken_log)
+        and taken_log[-1].bias in _DIRECTIONAL
+        and bias in _DIRECTIONAL
+        and taken_log[-1].bias != bias
+    )
     if state.last_trade_time is not None and not is_reversal:
         gap = (now_ist() - state.last_trade_time).seconds // 60
         if gap < min_gap:

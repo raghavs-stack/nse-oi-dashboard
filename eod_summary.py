@@ -246,14 +246,39 @@ def analyse(symbol: str, date_str: str) -> list[str]:
     if not skipped.empty:
         sub(f"Skip reasons:")
         reasons = skipped["SkipReason"].value_counts()
-        # Group "Too soon" messages (one per minute) into a single summary line
+        # Collapse all "Too soon" variants into one summary line
         too_soon_total = sum(cnt for r, cnt in reasons.items() if r.startswith("Too soon"))
+        # Collapse all "Opening gate" variants into one summary line
+        open_gate_total = sum(cnt for r, cnt in reasons.items() if r.startswith("Opening gate"))
+        # Cap individual score-based reasons to top 12 — avoids 38-row lists
+        score_reasons = [(r, c) for r, c in reasons.items()
+                         if r.startswith("Score")]
+        other_reasons = [(r, c) for r, c in reasons.items()
+                         if not r.startswith("Too soon")
+                         and not r.startswith("Opening gate")
+                         and not r.startswith("Score")]
+        TOP_SCORE_ROWS = 12
         printed_too_soon = False
+        printed_gate     = False
+        score_printed    = 0
+        score_remainder_cnt = sum(c for _, c in score_reasons[TOP_SCORE_ROWS:])
         for reason, cnt in reasons.items():
             if reason.startswith("Too soon"):
                 if not printed_too_soon and too_soon_total > 0:
                     sub(f"  {too_soon_total:>3}x  Too soon after last trade (within min gap)")
                     printed_too_soon = True
+                continue
+            if reason.startswith("Opening gate"):
+                if not printed_gate and open_gate_total > 0:
+                    sub(f"  {open_gate_total:>3}x  Opening gate (noise filter)")
+                    printed_gate = True
+                continue
+            if reason.startswith("Score"):
+                if score_printed < TOP_SCORE_ROWS:
+                    sub(f"  {cnt:>3}x  {reason}")
+                    score_printed += 1
+                    if score_printed == TOP_SCORE_ROWS and score_remainder_cnt > 0:
+                        sub(f"        … {score_remainder_cnt} more cycles in other score buckets")
                 continue
             sub(f"  {cnt:>3}x  {reason}")
 
@@ -280,11 +305,14 @@ def analyse(symbol: str, date_str: str) -> list[str]:
         sub("All signals were below the quality gate (score < 55) or trade cap reached.")
         # Show what would have happened to the best signal
         if not skipped.empty:
-            best = skipped.loc[score_vals.idxmax()]
-            sub(f"")
-            sub(f"Best missed signal:  {best['Timestamp'].strftime('%H:%M')}  "
-                f"Score:{int(best['Score'])}  {best['Bias']}  Spot:₹{float(best['Spot']):,.2f}")
-            sub(f"  Recs: {best['Rec1']}  |  {best['Rec2']}  |  {best['Rec3']}")
+            # BUG-08 fix: only pick best among actually-skipped rows
+            _skipped_scores = pd.to_numeric(skipped["Score"], errors="coerce").dropna()
+            if not _skipped_scores.empty:
+                best = skipped.loc[_skipped_scores.idxmax()]
+                sub(f"")
+                sub(f"Best missed signal:  {best['Timestamp'].strftime('%H:%M')}  "
+                    f"Score:{int(best['Score'])}  {best['Bias']}  Spot:₹{float(best['Spot']):,.2f}")
+                sub(f"  Recs: {best['Rec1']}  |  {best['Rec2']}  |  {best['Rec3']}")
     else:
         # Parse Rec columns: format is  STRIKETYPE@PREMIUM  e.g. 24200CE@63.5
         def parse_rec(rec_str):
@@ -375,7 +403,9 @@ def analyse(symbol: str, date_str: str) -> list[str]:
         blank()
         hdr("6. WHAT-IF: BEST SKIPPED SIGNAL")
         hdr("─" * (W - 2))
-        best_skip_idx  = score_vals[skipped.index].idxmax() if not score_vals[skipped.index].empty else None
+        # BUG-09 fix: score_vals.dropna() may not contain all skipped indices
+        _skipped_score2 = pd.to_numeric(skipped["Score"], errors="coerce").dropna()
+        best_skip_idx   = _skipped_score2.idxmax() if not _skipped_score2.empty else None
         if best_skip_idx is not None:
             best = df.loc[best_skip_idx]
             sub(f"Highest-score skipped: {best['Timestamp'].strftime('%H:%M')}  "

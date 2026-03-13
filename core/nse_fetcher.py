@@ -14,8 +14,8 @@ from config import MAX_RETRIES
 from core.market_hours import now_ist
 
 # ── Strike helpers ────────────────────────────────────────────────
-def nearest_strike_nf(x):   return int(math.ceil(float(x) / 50)  * 50)
-def nearest_strike_bnf(x):  return int(math.ceil(float(x) / 100) * 100)
+def nearest_strike_nf(x):   return int(round(float(x) / 50)  * 50)
+def nearest_strike_bnf(x):  return int(round(float(x) / 100) * 100)
 def nearest_strike(x, sym): return nearest_strike_bnf(x) if sym == "BANKNIFTY" else nearest_strike_nf(x)
 def strike_step(sym):        return 100 if sym == "BANKNIFTY" else 50
 
@@ -157,7 +157,11 @@ def demo_data(symbol: str, cycle: int) -> dict:
     atm_iv_base = 11.5   if symbol == "NIFTY" else 13.0
     spot   = base + math.sin(cycle * 0.3) * 90 + random.uniform(-20, 20)
     atm    = round(spot / step) * step
-    expiry = "27-Mar-2025"
+    # Use next upcoming Thursday as demo expiry
+    from datetime import date as _date, timedelta as _td
+    _d = _date.today()
+    _days_to_thu = (3 - _d.weekday()) % 7 or 7
+    expiry = (_d + _td(days=_days_to_thu)).strftime("%d-%b-%Y")
     atm_iv = max(8.0, min(25.0, atm_iv_base + math.sin(cycle*0.15)*1.2 + random.uniform(-0.3,0.3)))
     items  = []
     for i in range(-10, 11):

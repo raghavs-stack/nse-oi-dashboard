@@ -18,6 +18,7 @@ from datetime import datetime
 _ENABLED = False
 _TOKEN   = ""
 _CHAT_ID = ""
+_last_info_alert: dict = {}   # symbol → datetime of last non-taken alert
 
 
 def init_telegram() -> bool:
@@ -53,21 +54,42 @@ def _send(text: str):
 
 def send_signal(signal, adv: dict = None):
     """
-    Send a trade signal message. Includes bias, score, recs, and key analytics.
-    Call this when a signal is taken (or above threshold even if skipped).
+    Send a trade signal message.
+    - Taken signals: always send immediately (real money on the line).
+    - Informational (score≥70 but not taken): throttled to one per
+      INFO_ALERT_COOLDOWN_MINS per symbol to prevent Telegram flood.
     """
     if not _ENABLED:
         return
 
-    s     = signal
+    s = signal
+
+    if not s.taken:
+        # Rate-limit informational alerts per symbol
+        try:
+            from config import INFO_ALERT_COOLDOWN_MINS
+        except ImportError:
+            INFO_ALERT_COOLDOWN_MINS = 30
+        sym_key = getattr(s, "symbol", "") or "DEFAULT"
+        last    = _last_info_alert.get(sym_key)
+        if last is not None:
+            elapsed_mins = (datetime.now() - last).total_seconds() / 60
+            if elapsed_mins < INFO_ALERT_COOLDOWN_MINS:
+                return  # still within cooldown window — skip silently
+        _last_info_alert[sym_key] = datetime.now()
+
     taken = "✅ TRADE TAKEN" if s.taken else "ℹ️ SIGNAL (not taken)"
     bias_icon = "🟢" if s.bias == "BULLISH" else ("🔴" if s.bias == "BEARISH" else "🟡")
 
+    sym_label = getattr(s, "symbol", "") or ""
+    sym_prefix = f"{sym_label} | " if sym_label else ""
     lines = [
-        f"<b>{bias_icon} {s.bias} — {taken}</b>",
+        f"<b>{sym_prefix}{bias_icon} {s.bias} — {taken}</b>",
         f"🕐 {datetime.now().strftime('%H:%M IST')}  |  Score: <b>{s.score}/100</b>",
         f"Spot: ₹{s.spot:,.2f}  |  PCR: {s.pcr:.3f}",
-        f"ATM IV: {s.atm_iv:.2f}%  IVR: {s.ivr}  IVP: {s.ivp}",
+        f"ATM IV: {s.atm_iv:.2f}%  IVR: {s.ivr}  IVP: {s.ivp}"
+        if s.atm_iv is not None else
+        f"ATM IV: warming…  IVR: {s.ivr}  IVP: {s.ivp}",
         "",
         f"📌 <b>Recommendations:</b>",
         f"  1. {s.rec1.strike} {s.rec1.opt_type} @ ₹{s.rec1.premium}  SL:{s.rec1.sl}  T:{s.rec1.target}",

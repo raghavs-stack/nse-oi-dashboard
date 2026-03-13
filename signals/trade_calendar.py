@@ -21,10 +21,20 @@ from core.market_hours import now_ist
 
 
 # ── NIFTY expiry calendar ─────────────────────────────────────────
-# Weekly: every Tuesday (NIFTY) / Wednesday (BANKNIFTY)
-# Monthly: last Thursday of each month
-WEEKLY_EXPIRY_DOW  = {"NIFTY": 1, "BANKNIFTY": 2}   # Mon=0 … Fri=4
-MONTHLY_EXPIRY_DOW = {"NIFTY": 3, "BANKNIFTY": 3}   # Thursday
+# NSE Circular NSE/FAOP/68747 (Jun 25, 2025) — effective Sep 1, 2025:
+#   All index/stock derivatives expiry moved from Thursday → Tuesday.
+#
+#   NIFTY weekly    → Tuesday (1)   [was Thursday from 2023; back to Tuesday]
+#   BANKNIFTY       → NO weekly contracts; monthly = Last Tuesday of month
+#   FINNIFTY        → NO weekly contracts; monthly = Last Tuesday of month
+#   MIDCPNIFTY      → NO weekly contracts; monthly = Last Tuesday of month
+#
+# WEEKLY_EXPIRY_DOW used by days_to_weekly_expiry():
+#   For symbols with NO weekly, the value is set to Tuesday (1) so the
+#   function returns days to the next Tuesday-aligned expiry, which is
+#   the nearest monthly expiry for those symbols.
+WEEKLY_EXPIRY_DOW  = {"NIFTY": 1, "BANKNIFTY": 1, "FINNIFTY": 1, "MIDCPNIFTY": 1}
+MONTHLY_EXPIRY_DOW = {"NIFTY": 1, "BANKNIFTY": 1}   # Last Tuesday
 
 
 def _next_weekday(target_dow: int, from_date: date = None) -> date:
@@ -36,16 +46,20 @@ def _next_weekday(target_dow: int, from_date: date = None) -> date:
     return d + timedelta(days=days_ahead)
 
 
-def _last_thursday_of_month(d: date = None) -> date:
-    """Return the last Thursday of the current month."""
+def _last_tuesday_of_month(d: date = None) -> date:
+    """Return the last Tuesday of the month containing d.
+
+    NSE Circular NSE/FAOP/68747: all index/stock derivatives monthly
+    expiry moved from last Thursday → last Tuesday (effective Sep 1, 2025).
+    """
     d = d or date.today()
     # Last day of month
     if d.month == 12:
         last = date(d.year + 1, 1, 1) - timedelta(days=1)
     else:
         last = date(d.year, d.month + 1, 1) - timedelta(days=1)
-    # Walk back to Thursday (weekday=3)
-    while last.weekday() != 3:
+    # Walk back to Tuesday (weekday=1)
+    while last.weekday() != 1:
         last -= timedelta(days=1)
     return last
 
@@ -60,22 +74,22 @@ def days_to_weekly_expiry(symbol: str = "NIFTY") -> int:
 
 
 def days_to_monthly_expiry(symbol: str = "NIFTY") -> int:
-    """Days remaining to last-Thursday monthly expiry."""
+    """Days remaining to last-Tuesday monthly expiry (NSE circular Jun-2025)."""
     today   = date.today()
-    monthly = _last_thursday_of_month(today)
+    monthly = _last_tuesday_of_month(today)
     if monthly < today:
         # Next month
         next_m = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
-        monthly = _last_thursday_of_month(next_m)
+        monthly = _last_tuesday_of_month(next_m)
     return (monthly - today).days
 
 
 # ── Day-of-week quality matrix ───────────────────────────────────
-# Based on NIFTY statistical analysis:
+# Based on NIFTY statistical analysis (NSE circular Jun-2025 schedule):
 #   Mon: gap openings, highest whipsaw rate → sell-only with caution
-#   Tue: weekly expiry day → high gamma risk, avoid near-ATM
-#   Wed: best mid-week; IV normalized, good for both
-#   Thu: directional strength post monthly expiry
+#   Tue: NIFTY weekly expiry → high gamma risk, avoid near-ATM positions
+#   Wed: best mid-week; IV normalized, 6 days to expiry — good for both sides
+#   Thu: no expiry pressure; strong directional/momentum day
 #   Fri: premium selling edge (weekend theta collection)
 
 DOW_PROFILE = {
@@ -88,13 +102,13 @@ DOW_PROFILE = {
         "note":  "Weekend gaps common. Wait for 10:30 AM trend confirmation.",
         "avoid": True,
     },
-    1: {  # Tuesday — NIFTY weekly expiry
+    1: {  # Tuesday — NIFTY weekly expiry (NSE circular Jun-2025: Thu→Tue)
         "score": 40,
-        "label": "Expiry Day",
+        "label": "NIFTY Expiry",
         "color": "#e74c3c",
         "buy_edge":  "Low",
         "sell_edge": "High",
-        "note":  "Weekly expiry. Near-ATM gamma explodes. Only sell far-OTM spreads.",
+        "note":  "NIFTY weekly expiry day. Near-ATM gamma risk explodes. Sell far-OTM or trade BNF instead.",
         "avoid": True,
     },
     2: {  # Wednesday
@@ -106,13 +120,13 @@ DOW_PROFILE = {
         "note":  "Peak liquidity, 6 days to next expiry. Best for directional & premium selling.",
         "avoid": False,
     },
-    3: {  # Thursday
+    3: {  # Thursday — no expiry since NSE circular Jun-2025; good directional day
         "score": 70,
         "label": "Good",
         "color": "#3498db",
         "buy_edge":  "High",
         "sell_edge": "Medium",
-        "note":  "Strong directional moves post monthly expiry reset. Buy momentum plays.",
+        "note":  "No expiry risk (NIFTY moved to Tuesday). Strong directional session — good for momentum buys.",
         "avoid": False,
     },
     4: {  # Friday

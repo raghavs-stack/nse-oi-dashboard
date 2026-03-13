@@ -1,7 +1,7 @@
 # ════════════════════════════════════════════════════════════════
 #  display/terminal.py
 #  Non-scrolling terminal / Colab display.
-#  v5.6: adds IV section + GEX + SmartMoney + Flow + Dealer (ATM IV, IVR, IVP, daily IV, skew).
+#  v5.7: adds IV section + GEX + SmartMoney + Flow + Dealer (ATM IV, IVR, IVP, daily IV, skew).
 # ════════════════════════════════════════════════════════════════
 
 import os
@@ -73,7 +73,7 @@ def render(df, symbol, spot, vix, expiry, pcr, bias,
 
     # ── Header ───────────────────────────────────────────────────
     a(SEP)
-    a(f"  {symbol} OI DASHBOARD v5.6 [{mode_tag}]  "
+    a(f"  {symbol} OI DASHBOARD v5.7 [{mode_tag}]  "
       f"{now_ist().strftime('%H:%M:%S IST')}  Cycle #{cycle}")
     a(f"  Spot: Rs{spot:,.2f}  |  VIX: {vix}  |  Expiry: {expiry}  |  Lot: {LOT_SIZE}")
     a(SEP)
@@ -163,7 +163,7 @@ def render(df, symbol, spot, vix, expiry, pcr, bias,
             a(f"  >> {al}")
         a(THN)
 
-    # ── Advanced analytics (v5.6 NEW) ────────────────────────────
+    # ── Advanced analytics (v5.7 NEW) ────────────────────────────
     if adv:
         g   = adv.get("gamma",       {})
         sm  = adv.get("smart_money", {})
