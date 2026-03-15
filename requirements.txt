@@ -6,3 +6,10 @@ pyotp>=2.8.0
 pytz>=2023.3
 streamlit>=1.32.0
 requests>=2.31.0
+# ── ML / Deep Learning (v5.9) ────────────────────────────────
+scikit-learn>=1.4.0         # RandomForest, LogisticRegression, MLP fallback
+xgboost>=2.0.0              # XGBClassifier (falls back to sklearn GBT if absent)
+mxnet>=2.0.0                # Gluon MLP (CPU); falls back to sklearn MLP if absent
+# Note: mxnet CPU-only wheel:  pip install mxnet
+#       GPU (CUDA 11.2):       pip install mxnet-cu112
+#       If Python >3.8 only:   pip install --pre mxnet

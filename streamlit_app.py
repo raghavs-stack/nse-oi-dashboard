@@ -909,6 +909,174 @@ def render_symbol(symbol: str):
             st.error(f"⚡ **{bk.get('signal')}** | Res ₹{bk.get('resistance','?'):,} | Sup ₹{bk.get('support','?'):,}")
 
     # ── Trade recs ────────────────────────────────────────────────
+    # ── v5.10 Analytics: Regime + Greeks + Cone + Kelly ─────────────
+    _regime    = state.get("regime",        {})
+    _vcone     = state.get("vcone",          {})
+    _kelly     = state.get("kelly",          {})
+    _ranked    = state.get("ranked_strikes", [])
+
+    # ── 1. Market Regime (Hurst exponent) ────────────────────────────
+    if _regime:
+        st.markdown("---")
+        st.markdown("##### 📊 Market Regime")
+        _rg   = _regime.get("regime",      "RANGING")
+        _h    = _regime.get("hurst",        None)
+        _ac   = _regime.get("autocorr",     None)
+        _buy  = _regime.get("buy_options",  False)
+        _rnote= _regime.get("regime_note",  "")
+        _vinfo= _regime.get("vol_info",     {})
+        _rcolor = ("#2ecc71" if _buy else
+                   "#e74c3c" if _rg in ("MEAN_REVERTING","RANGING","PANIC") else "#f39c12")
+        _ricon  = "✅" if _buy else "⚠️"
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.markdown(
+            f'<div style="background:#161b22;border-radius:8px;padding:10px;text-align:center;">'
+            f'<div style="font-size:10px;color:#888;">Regime</div>'
+            f'<div style="font-size:16px;font-weight:bold;color:{_rcolor};">{_ricon} {_rg}</div>'
+            f'</div>', unsafe_allow_html=True)
+        rc2.markdown(
+            f'<div style="background:#161b22;border-radius:8px;padding:10px;text-align:center;">'
+            f'<div style="font-size:10px;color:#888;">Hurst H</div>'
+            f'<div style="font-size:16px;font-weight:bold;color:#aaa;">'
+            f'{"H=" + str(_h) if _h else "warming up"}</div>'
+            f'<div style="font-size:10px;color:#666;">H>0.58=trend</div>'
+            f'</div>', unsafe_allow_html=True)
+        rc3.markdown(
+            f'<div style="background:#161b22;border-radius:8px;padding:10px;text-align:center;">'
+            f'<div style="font-size:10px;color:#888;">Autocorr</div>'
+            f'<div style="font-size:16px;font-weight:bold;color:#aaa;">'
+            f'{_ac:.3f if isinstance(_ac, float) else "N/A"}</div>'
+            f'<div style="font-size:10px;color:#666;">+ve=momentum</div>'
+            f'</div>', unsafe_allow_html=True)
+        _volz = _vinfo.get("vol_z", 0)
+        _vlbl = _vinfo.get("regime", "NORMAL")
+        rc4.markdown(
+            f'<div style="background:#161b22;border-radius:8px;padding:10px;text-align:center;">'
+            f'<div style="font-size:10px;color:#888;">Vol Regime</div>'
+            f'<div style="font-size:16px;font-weight:bold;color:#aaa;">{_vlbl}</div>'
+            f'<div style="font-size:10px;color:#666;">z={_volz:.2f}</div>'
+            f'</div>', unsafe_allow_html=True)
+        st.caption(f"💡 {_rnote}")
+
+    # ── 2. Volatility Cone ────────────────────────────────────────────
+    if _vcone:
+        st.markdown("---")
+        st.markdown("##### 🌀 Volatility Cone — IV vs Realized Vol")
+        _vc_sig   = _vcone.get("signal",      "FAIR")
+        _vc_rv20  = _vcone.get("rv_20",        None)
+        _vc_rv60  = _vcone.get("rv_60",        None)
+        _vc_ratio = _vcone.get("iv_rv_ratio",  None)
+        _vc_cpct  = _vcone.get("cone_pct",     None)
+        _vc_edge  = _vcone.get("buy_edge",     False)
+        _vc_color = ("#2ecc71" if _vc_sig == "CHEAP" else
+                     "#e74c3c" if _vc_sig == "EXPENSIVE" else "#f39c12")
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        vc1.metric("IV vs RV", _vc_sig, delta="BUY EDGE ✅" if _vc_edge else "No edge")
+        vc2.metric("IV/RV20 Ratio",
+                   f"{_vc_ratio:.2f}" if _vc_ratio else "N/A",
+                   delta="cheap" if _vc_ratio and _vc_ratio < 1.0 else "expensive")
+        vc3.metric("RV20", f"{_vc_rv20:.1f}%" if _vc_rv20 else "N/A")
+        vc4.metric("Cone %ile", f"{_vc_cpct:.0f}%" if _vc_cpct else "N/A")
+
+    # ── 3. Greeks Dashboard ───────────────────────────────────────────
+    if _ranked:
+        st.markdown("---")
+        st.markdown("##### ⚗️ Options Greeks & EV — Ranked Strikes")
+        _grade_colors = {"A": "#2ecc71", "B": "#3498db", "C": "#f39c12", "SKIP": "#e74c3c"}
+        for _rs in _ranked:
+            _gc  = _grade_colors.get(_rs.get("grade", "C"), "#aaa")
+            _pct = _rs.get("ev_pct", 0)
+            _evc = "#2ecc71" if _pct >= 20 else ("#f39c12" if _pct >= 10 else "#e74c3c")
+            st.markdown(
+                f'<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;'
+                f'padding:10px 14px;margin-bottom:8px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                f'<span style="font-weight:bold;color:#e6edf3;">'
+                f'₹{_rs.get("strike",0):,} {_rs.get("opt_type","")} — {_rs.get("label","")}</span>'
+                f'<span style="background:{_gc};color:#000;border-radius:4px;padding:2px 8px;'
+                f'font-weight:bold;font-size:12px;">Grade {_rs.get("grade","?")}</span></div>'
+                f'<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-top:8px;">'
+                f'<div style="text-align:center;"><div style="font-size:10px;color:#888;">Δ Delta</div>'
+                f'<div style="font-size:14px;color:#aaa;">{_rs.get("delta",0):+.3f}</div></div>'
+                f'<div style="text-align:center;"><div style="font-size:10px;color:#888;">Γ Gamma</div>'
+                f'<div style="font-size:14px;color:#aaa;">{_rs.get("gamma",0):.5f}</div></div>'
+                f'<div style="text-align:center;"><div style="font-size:10px;color:#888;">θ Theta/d</div>'
+                f'<div style="font-size:14px;color:#e74c3c;">{_rs.get("theta",0):.2f}</div></div>'
+                f'<div style="text-align:center;"><div style="font-size:10px;color:#888;">ν Vega/%</div>'
+                f'<div style="font-size:14px;color:#3498db;">{_rs.get("vega",0):.2f}</div></div>'
+                f'<div style="text-align:center;"><div style="font-size:10px;color:#888;">P(ITM)</div>'
+                f'<div style="font-size:14px;color:#aaa;">{_rs.get("prob_itm",0):.0%}</div></div>'
+                f'<div style="text-align:center;"><div style="font-size:10px;color:#888;">EV %</div>'
+                f'<div style="font-size:14px;font-weight:bold;color:{_evc};">{_pct:+.0f}%</div></div>'
+                f'</div></div>', unsafe_allow_html=True)
+
+    # ── 4. Kelly Position Sizing ──────────────────────────────────────
+    if _kelly:
+        st.markdown("---")
+        st.markdown("##### 🎲 Kelly Position Sizing")
+        _kf   = _kelly.get("kelly_f",   0)
+        _lots = _kelly.get("lots",       1)
+        _wr   = _kelly.get("win_rate",  0.5)
+        _conf = _kelly.get("confidence","DEFAULT")
+        _ntrd = _kelly.get("n_trades",   0)
+        _knote= _kelly.get("note",       "")
+        _kcolor = "#2ecc71" if _lots >= 2 else ("#f39c12" if _lots == 1 else "#e74c3c")
+        ka, kb, kc, kd = st.columns(4)
+        ka.metric("Lots",        f"{_lots} lot(s)",
+                  delta=f"Kelly f*={_kf:.1%}")
+        kb.metric("Win Rate",    f"{_wr:.0%}",
+                  delta=f"{_ntrd} trades")
+        kc.metric("Confidence",  _conf)
+        kd.markdown(
+            f'<div style="background:#161b22;border-radius:8px;padding:8px 12px;">'
+            f'<div style="font-size:10px;color:#888;">Sizing note</div>'
+            f'<div style="font-size:11px;color:#aaa;margin-top:3px;">{_knote}</div>'
+            f'</div>', unsafe_allow_html=True)
+
+    # ── ML Ensemble Panel ────────────────────────────────────────
+    ml_res = state.get("ml_result", {})
+    if ml_res:
+        st.markdown("---")
+        st.markdown("##### 🤖 ML Ensemble Signal")
+        _ml_sig  = ml_res.get("signal",          "NEUTRAL")
+        _ml_con  = ml_res.get("confidence",      0.5)
+        _ml_pts  = ml_res.get("score_pts",       0)
+        _ml_rows = ml_res.get("data_rows",       0)
+        _ml_syn  = ml_res.get("using_synthetic", True)
+        _ml_trn  = ml_res.get("trained",         False)
+        _ml_mdl  = ml_res.get("models",          {})
+        _sig_color = ("green" if _ml_sig == "CONFIRM" else
+                      "red"   if _ml_sig == "CONTRA"  else "orange")
+        _sig_icon  = ("✅" if _ml_sig == "CONFIRM" else
+                      "❌" if _ml_sig == "CONTRA"  else "⬜")
+        _src_lbl   = ("synthetic" if _ml_syn else f"{_ml_rows:,} real cycles")
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("ML Signal",   f"{_sig_icon} {_ml_sig}")
+        mc2.metric("Confidence",  f"{_ml_con:.0%}")
+        mc3.metric("Score Δ",     f"{_ml_pts:+d} pts")
+        mc4.metric("Trained on",  _src_lbl)
+
+        if _ml_trn and _ml_mdl:
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+            b1, b2, b3, b4 = st.columns(4)
+            for _bcol, _blbl, _bkey in [
+                (b1, "🌲 RandomForest", "rf"),
+                (b2, "📈 LogisticReg",  "lr"),
+                (b3, "⚡ XGBoost/GBT",  "xgb"),
+                (b4, "🧠 Gluon/MLP",    "mlp"),
+            ]:
+                _bv = _ml_mdl.get(_bkey, 0.5)
+                _bc = ("#2ecc71" if _bv >= 0.65 else
+                       "#e74c3c" if _bv <= 0.38 else "#f39c12")
+                _bcol.markdown(
+                    f'<div style="background:#161b22;border-radius:6px;'
+                    f'padding:8px 10px;text-align:center;">'
+                    f'<div style="font-size:10px;color:#888;">{_blbl}</div>'
+                    f'<div style="font-size:20px;font-weight:bold;'
+                    f'color:{_bc};">{_bv:.0%}</div></div>',
+                    unsafe_allow_html=True)
+
     recs = state.get("recs", [])
     if recs:
         st.markdown("---")

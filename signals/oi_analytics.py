@@ -138,10 +138,13 @@ def compute_roc_alerts(data_items: list, expiry: str) -> list[str]:
 #  Raw max                              115  → capped at 100 by min(100,sum)
 def score_signal(bias, votes, pcr, net_score, spot, max_pain,
                  vix_str, roc_alerts, tech_signal="NEUTRAL",
-                 dealer_vote="NEUTRAL", pcr_trend_bars: int = 0) -> tuple:
+                 dealer_vote="NEUTRAL", pcr_trend_bars: int = 0,
+                 ml_score_pts: int = 0,
+                 regime_score_pts: int = 0) -> tuple:
     """
     Returns (score: int, breakdown: dict, unanimous: bool).
 
+    v5.9: Factor 10 = ML ensemble (sklearn RF/LR, xgboost, mxnet Gluon MLP)
     v5.7 scoring improvements vs original:
       Fix 1  Unanimity   — proportional (votes/total × 20) not cliff-edge
       Fix 2  PCR trend   — rising PCR adds up to 5 confirmation bonus pts
@@ -205,13 +208,22 @@ def score_signal(bias, votes, pcr, net_score, spot, max_pain,
     _consec = getattr(state, "consecutive_bias_cycles", 0)
     pts["trend_persist"] = min(10, (_consec // 10))
 
+    # Factor 10: ML ensemble — sklearn RF/LR, xgboost, mxnet Gluon MLP
+    # +0-10 pts when CONFIRM (ensemble confidence ≥ 0.65)
+    # −5 pts when CONTRA (ensemble confidence ≤ 0.38 = ML disagrees)
+    pts["ml"] = ml_score_pts
+
+    # Factor 11: Market regime (Hurst exponent)
+    # TRENDING_UP/DOWN = +10 pts; RANGING/MEAN_REVERTING = 0 pts (no penalty, just no bonus)
+    pts["regime"] = min(10, max(0, regime_score_pts))
+
     return min(100, sum(pts.values())), pts, unanimous
 
 
 # ────────────────────────────────────────────────────────────────
 #  Trade Filter
 # ────────────────────────────────────────────────────────────────
-def should_take_trade(score: int, bias: str, spot: float = 0) -> tuple[bool, str]:
+def should_take_trade(score: int, bias: str, spot: float = 0, ev_pct: float = None) -> tuple[bool, str]:
     """
     4-gate trade filter. Returns (take: bool, reason: str).
 
@@ -232,6 +244,14 @@ def should_take_trade(score: int, bias: str, spot: float = 0) -> tuple[bool, str
         return False, f"Daily cap reached ({state.daily_trades_taken}/{max_cap})"
     if score < MIN_SIGNAL_SCORE:
         return False, f"Score {score}/100 < min {MIN_SIGNAL_SCORE}"
+
+    # EV gate: block if the best available strike has negative expected value
+    # Implements meta-labeling: direction confirmed, but is there BUYING edge?
+    if ev_pct is not None and ev_pct < _cfg.MIN_EV_PCT and bias != "NEUTRAL":
+        return False, (
+            f"EV gate: best strike EV={ev_pct:.0f}% < min {_cfg.MIN_EV_PCT:.0f}% "
+            f"— no statistical buying edge"
+        )
 
     # Opening-session gate — no trades in the first N minutes after market open.
     # Early-morning volatility (09:15-09:35) produces noisy signals.

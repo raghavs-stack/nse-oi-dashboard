@@ -6,6 +6,16 @@
 
 from signals.indicators import StrategyEngine
 
+# ── Spot price series for Hurst / realized-vol calculations ─────
+spot_series: list = []          # rolling spot prices (last 200 cycles)
+SPOT_SERIES_MAX = 200
+
+# ── Open option positions (exit engine) ──────────────────────────
+open_positions: list = []       # list of OpenPosition objects
+
+# ── Kelly / per-session trade stats ─────────────────────────────
+kelly_data: dict = {}           # latest kelly_sizing() result
+
 # ── OI tracking ──────────────────────────────────────────────────
 prev_oi:     dict = {}  # strike -> {"CE": oi, "PE": oi} — previous CYCLE OI for RoC
 baseline_oi: dict = {}  # strike -> {"CE": oi, "PE": oi} — SESSION START OI for ΔOI chart
@@ -50,3 +60,7 @@ def reset_day():
     from config import PCR_BEARISH, PCR_BULLISH
     pcr_bearish = PCR_BEARISH
     pcr_bullish = PCR_BULLISH
+    global spot_series, open_positions, kelly_data
+    spot_series   = []
+    open_positions = []
+    kelly_data    = {}

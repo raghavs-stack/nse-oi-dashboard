@@ -50,7 +50,8 @@ def render(df, symbol, spot, vix, expiry, pcr, bias,
            pcr_signal="NEUTRAL", pcr_signal_color="#f39c12",
            local_pcr=None,
            iv_data: dict = None,
-           adv: dict = None):
+           adv: dict = None,
+           ml_result: dict = None):
     """
     Atomic screen update — builds full output then clears and prints at once.
     In tkinter mode this is a no-op (OITkApp handles its own rendering).
@@ -128,7 +129,18 @@ def render(df, symbol, spot, vix, expiry, pcr, bias,
           f"Time:{bd.get('time',0):>2}  "
           f"RoC:{bd.get('roc',0):>2}  "
           f"RSI+VWAP:{bd.get('rsi_vwap',0):>2}  "
-          f"Dealer:{bd.get('dealer',0):>2}")
+          f"Dealer:{bd.get('dealer',0):>2}  "
+          f"ML:{bd.get('ml',0):>3}")
+    if ml_result and ml_result.get("trained"):
+        _ml_sig = ml_result.get("signal", "NEUTRAL")
+        _ml_con = ml_result.get("confidence", 0.5)
+        _ml_ico = ("✅" if _ml_sig == "CONFIRM" else
+                   "❌" if _ml_sig == "CONTRA"  else "⬜")
+        _ml_m   = ml_result.get("models", {})
+        _src    = "SYNTH" if ml_result.get("using_synthetic") else f"{ml_result.get('data_rows',0)}rows"
+        a(f"  ML Ensemble ({_src}): {_ml_ico} {_ml_sig}  conf={_ml_con:.0%}  "
+          f"RF={_ml_m.get('rf',0):.2f}  LR={_ml_m.get('lr',0):.2f}  "
+          f"XGB={_ml_m.get('xgb',0):.2f}  MLP={_ml_m.get('mlp',0):.2f}")
     a(filter_line)
     a(THN)
 

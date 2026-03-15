@@ -27,6 +27,7 @@ import config
 from config import (
     SYMBOL, LOT_SIZE, REFRESH_RATE, LOG_FILE,
     MAX_TRADES_PER_DAY, LOCALIZED_PCR_RANGE, RSI_PERIOD,
+    ML_ENABLED, ML_RETRAIN_CYCLES,
 )
 from core.market_hours import is_market_open, is_eod, next_open_str, now_ist
 from core.nse_fetcher  import (
@@ -46,7 +47,15 @@ from signals.iv_analytics import (
 )
 from signals.advanced_analytics import run_advanced_analytics
 from signals.multi_pcr import PCRSeries, classify_expiries, calc_pcr_for_expiry
-from signals.trade_calendar import get_day_quality
+from signals.ml_signal  import MLPredictor, get_predictor
+from signals.trade_calendar   import get_day_quality
+from signals.regime_detector  import classify_regime
+from signals.options_math     import rank_strikes, volatility_cone, option_buy_gate
+from signals.kelly_sizing     import kelly_sizing
+from config import (
+    REGIME_MIN_WINDOW, REGIME_SCORE_WEIGHT, MIN_PROB_ITM,
+    MIN_EV_PCT, TARGET_PREMIUM_MULT, SL_PREMIUM_MULT, KELLY_HALF,
+)
 from signals.strategy_classifier import classify_strategy, format_strategy_panel
 from alerts.telegram_alerts import (
     init_telegram, send_signal, send_breakout, send_roc_alert, send_eod_summary,
@@ -87,7 +96,8 @@ class SymbolEngine:
         self.strategy_engine = StrategyEngine()
         self.eod_done    = False
         self.cycle       = 0
-        self.baseline_oi = {}  # session-start OI per strike for intraday ΔOI chart
+        self.baseline_oi  = {}  # session-start OI per strike for intraday ΔOI chart
+        self.ml_predictor = MLPredictor(symbol)  # per-symbol ML ensemble
 
 
 # ════════════════════════════════════════════════════════════════
@@ -250,7 +260,70 @@ def process_cycle(data: dict, symbol: str, vix: str,
 
     # ── Recommendations ────────────────────────────────────────
     # (strategy classifier runs AFTER score is known — removed placeholder call BUG-10)
-    recs = recommend_strikes(df, spot, bias, max_pain, resistance, support, symbol)
+    # ── Market regime (Factor 11) — Hurst exponent ──────────────
+    _regime_result = {"regime": "RANGING", "hurst": None, "autocorr": None,
+                      "buy_options": False, "regime_score": 45, "regime_note": "warming up"}
+    _regime_pts = 0
+    try:
+        if len(state.spot_series) >= REGIME_MIN_WINDOW:
+            _regime_result = classify_regime(
+                state.spot_series, vix=float(vix) if vix else 0.0, bias=bias
+            )
+            _regime_pts = REGIME_SCORE_WEIGHT if _regime_result["buy_options"] else 0
+    except Exception as _reg_err:
+        print(f"  [Regime] error: {_reg_err}")
+
+    # Re-score WITH regime bonus
+    score, breakdown, unanimous = score_signal(
+        bias, votes, pcr_for_bias, weighted_net_score, spot, max_pain,
+        vix, roc_alerts, tech_signal, dealer_vote=dealer_vote,
+        pcr_trend_bars=pcr_trend_bars,
+        ml_score_pts=_ml_result.get("score_pts", 0),
+        regime_score_pts=_regime_pts,
+    )
+
+    # ── Options math: rank strikes + EV ──────────────────────────
+    _dte        = day_qual.get("days_to_weekly", 7) if day_qual else 7
+    _tte        = max(1/365, _dte / 365.0)
+    _ranked     = []
+    _top_ev_pct = None
+    _vcone      = {}
+    try:
+        _ranked = rank_strikes(
+            df=df, spot=spot, bias=bias, tte=_tte,
+            current_iv=atm_iv or 15.0,
+            iv_history=iv_history.history,
+            lot_size=_lot_size, spot_series=state.spot_series,
+            symbol=symbol, n_strikes=3,
+        )
+        if _ranked:
+            _top_ev_pct = _ranked[0].ev_pct
+            _vcone = volatility_cone(
+                iv_history.history, atm_iv or 15.0, state.spot_series
+            )
+    except Exception as _opt_err:
+        print(f"  [OptionsMath] error: {_opt_err}")
+
+    # ── Kelly position sizing ─────────────────────────────────────
+    try:
+        state.kelly_data = kelly_sizing(
+            symbol=symbol, signal_log=state.signal_log,
+            target_mult=TARGET_PREMIUM_MULT, sl_mult=SL_PREMIUM_MULT,
+            half_kelly=KELLY_HALF,
+        )
+    except Exception as _kelly_err:
+        print(f"  [Kelly] error: {_kelly_err}")
+
+    # Use ranked strikes as recs if available, else fall back
+    if _ranked:
+        from backtest.eod_backtest import TradeRec
+        recs = [TradeRec(
+            label=r.label, strike=r.strike, opt_type=r.opt_type,
+            premium=r.premium, sl=r.sl, target=r.target,
+            lot_cost=r.lot_cost, rr=r.rr, reason=r.reason,
+        ) for r in _ranked]
+    else:
+        recs = recommend_strikes(df, spot, bias, max_pain, resistance, support, symbol)
     if len(recs) < 3:
         return None, {}, pd.DataFrame(), {}, {}, {}, {}
 
@@ -266,11 +339,30 @@ def process_cycle(data: dict, symbol: str, vix: str,
     else:
         pcr_trend_bars = 0
 
-    score, breakdown, unanimous = score_signal(
-        bias, votes, pcr_for_bias, weighted_net_score, spot, max_pain,
-        vix, roc_alerts, tech_signal, dealer_vote=dealer_vote,
-        pcr_trend_bars=pcr_trend_bars
-    )
+    # ── Track spot price series for regime / realized-vol ──────────
+    if spot > 0:
+        state.spot_series.append(spot)
+        if len(state.spot_series) > state.SPOT_SERIES_MAX:
+            state.spot_series = state.spot_series[-state.SPOT_SERIES_MAX:]
+
+    # ── ML ensemble (Factor 10) ─────────────────────────────────
+    _ml_result = {"score_pts": 0, "confidence": 0.5, "signal": "NEUTRAL",
+                  "models": {}, "trained": False,
+                  "using_synthetic": True, "data_rows": 0}
+    if ML_ENABLED:
+        try:
+            _ml_result = get_predictor(symbol).predict(
+                pcr_local  = local_pcr if local_pcr is not None else pcr_for_bias,
+                score      = 50,
+                atm_iv     = atm_iv or 15.0,
+                ivr        = hist_summ.get("ivr") or 50.0,
+                ivp        = hist_summ.get("ivp") or 50.0,
+                spot=spot, max_pain=max_pain,
+                resistance=resistance, support=support, bias=bias,
+            )
+        except Exception as _ml_err:
+            print(f"  [ML] predict error: {_ml_err}")
+
     # Re-run classifier with real score now known
     strat_class = classify_strategy(
         bias         = bias,
@@ -284,7 +376,7 @@ def process_cycle(data: dict, symbol: str, vix: str,
     )
 
     # ── Trade filter ───────────────────────────────────────────
-    take, filter_reason = should_take_trade(score, bias, spot=spot)
+    take, filter_reason = should_take_trade(score, bias, spot=spot, ev_pct=_top_ev_pct)
     if take:
         register_trade_taken()
 
@@ -330,7 +422,8 @@ def process_cycle(data: dict, symbol: str, vix: str,
            skip_reason=filter_reason, unanimous=unanimous,
            rsi=rsi_val, vwap=vwap_val, tech_signal=tech_signal,
            pcr_signal=pcr_signal, pcr_signal_color=pcr_signal_color,
-           local_pcr=local_pcr, iv_data=iv_data, adv=adv)
+           local_pcr=local_pcr, iv_data=iv_data, adv=adv,
+           ml_result=_ml_result)
 
     sig = Signal(
         time=now_ist().strftime("%H:%M"),
@@ -347,6 +440,17 @@ def process_cycle(data: dict, symbol: str, vix: str,
     # Previously these were referenced by name at call sites → NameError.
     _ctx = {
         "max_pain":         max_pain,
+        "ml_result":        _ml_result,
+        "regime_result":    _regime_result,
+        "ranked_strikes":   [{
+            "label": r.label, "strike": r.strike, "opt_type": r.opt_type,
+            "premium": r.premium, "ev_pct": r.ev_pct, "grade": r.buy_grade,
+            "prob_itm": r.greeks.prob_itm, "delta": r.greeks.delta,
+            "gamma": r.greeks.gamma, "theta": r.greeks.theta,
+            "vega": r.greeks.vega, "reason": r.reason,
+        } for r in _ranked],
+        "vcone":            _vcone,
+        "kelly":            state.kelly_data,
         "resistance":       resistance,
         "support":          support,
         "weighted_net_score": weighted_net_score,
@@ -403,7 +507,12 @@ def _write_streamlit_state(sig, adv: dict, df, spot: float, vix: str,
                            max_pain: float = 0, resistance: int = 0,
                            support: int = 0, net_score: int = 0,
                            local_pcr: float = None, pcr_signal: str = "NEUTRAL",
-                           pcr_signal_color: str = "#f39c12"):
+                           pcr_signal_color: str = "#f39c12",
+                           ml_result: dict = None,
+                           regime_result: dict = None,
+                           vcone: dict = None,
+                           kelly: dict = None,
+                           ranked_strikes: list = None):
     """Write current cycle state to dashboard_state.json for Streamlit."""
     from core.nse_fetcher import nearest_strike as _nearest_strike
     atm_df  = df[(df["Strike"] >= spot * 0.96) & (df["Strike"] <= spot * 1.04)].copy()
@@ -472,6 +581,11 @@ def _write_streamlit_state(sig, adv: dict, df, spot: float, vix: str,
         "pcr_series":  pcr_data    or {},
         "day_quality": day_qual    or {},
         "strat_class": strat_class or {},
+        "ml_result":   ml_result or {},
+        "regime":      regime_result or {},
+        "vcone":       vcone or {},
+        "kelly":       kelly or {},
+        "ranked_strikes": ranked_strikes or [],
     }
     state_file = f"dashboard_state_{config.SYMBOL}.json"
     try:
@@ -611,8 +725,19 @@ def run_symbol_cycle(eng: "SymbolEngine", vix: str, use_demo: bool) -> None:
     _state.strategy_engine     = eng.strategy_engine
     _state.baseline_oi         = eng.baseline_oi
 
+    import signals.ml_signal as _ml_mod
+    _save_ml_pred              = _ml_mod._default_predictor
+    _ml_mod._default_predictor = eng.ml_predictor
+
     try:
         eng.cycle += 1
+        # Train ML predictor on first cycle; retrain every ML_RETRAIN_CYCLES
+        if ML_ENABLED and (eng.cycle == 1 or eng.cycle % ML_RETRAIN_CYCLES == 0):
+            try:
+                eng.ml_predictor.train(force=(eng.cycle > 1))
+            except Exception as _ml_e:
+                print(f"  [ML] train error: {_ml_e}")
+
         if use_demo:
             data = demo_data(eng.symbol, eng.cycle)
         else:
@@ -634,7 +759,12 @@ def run_symbol_cycle(eng: "SymbolEngine", vix: str, use_demo: bool) -> None:
             max_pain=_ctx["max_pain"], resistance=_ctx["resistance"],
             support=_ctx["support"], net_score=_ctx["weighted_net_score"],
             local_pcr=_ctx["local_pcr"], pcr_signal=_ctx["pcr_signal"],
-            pcr_signal_color=_ctx["pcr_signal_color"])
+            pcr_signal_color=_ctx["pcr_signal_color"],
+            ml_result=_ctx.get("ml_result", {}),
+            regime_result=_ctx.get("regime_result", {}),
+            vcone=_ctx.get("vcone", {}),
+            kelly=_ctx.get("kelly", {}),
+            ranked_strikes=_ctx.get("ranked_strikes", []))
 
         # Breakout / Telegram alerts
         brk = adv.get("breakout", {}) if adv else {}
@@ -695,6 +825,7 @@ def run_symbol_cycle(eng: "SymbolEngine", vix: str, use_demo: bool) -> None:
         _state.pcr_bearish        = _save_bear
         _state.strategy_engine    = _save_engine
         _state.baseline_oi        = _save_baseline
+        _ml_mod._default_predictor = _save_ml_pred
 
 
 # ════════════════════════════════════════════════════════════════
@@ -813,7 +944,12 @@ def main():
                                    net_score=_ctx["weighted_net_score"],
                                    local_pcr=_ctx["local_pcr"],
                                    pcr_signal=_ctx["pcr_signal"],
-                                   pcr_signal_color=_ctx["pcr_signal_color"])
+                                   pcr_signal_color=_ctx["pcr_signal_color"],
+            ml_result=_ctx.get("ml_result", {}),
+            regime_result=_ctx.get("regime_result", {}),
+            vcone=_ctx.get("vcone", {}),
+            kelly=_ctx.get("kelly", {}),
+            ranked_strikes=_ctx.get("ranked_strikes", []))
 
             # Breakout alert via Telegram
             brk = adv.get("breakout", {}) if adv else {}

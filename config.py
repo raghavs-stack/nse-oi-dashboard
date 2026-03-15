@@ -84,6 +84,31 @@ IV_SKEW_CALL_HEAVY_THRESHOLD = -2.0  # IV skew % below this = CALL HEAVY
 IV_HISTORY_DAYS = 252       # 1 trading year for IVR / IVP calculation
 IV_DAILY_ALERT_SPIKE = 20   # % rise in ATM IV in one cycle to fire spike alert
 
+# ── High-Probability Option Buying (v5.10) ──────────────────────
+# Regime detector (signals/regime_detector.py)
+REGIME_MIN_WINDOW   = 30    # minimum cycles before regime is computed
+REGIME_SCORE_WEIGHT = 10    # max pts added to score for TRENDING regime
+
+# Options math gate (signals/options_math.py)
+MIN_PROB_ITM        = 0.35  # minimum P(ITM) to include a strike in recs
+MIN_EV_PCT          = 10.0  # minimum EV%  to take a trade
+TARGET_PREMIUM_MULT = 2.0   # exit at 2× premium (100% gain)
+SL_PREMIUM_MULT     = 0.5   # stop at 0.5× premium (50% loss)
+
+# Kelly position sizing (signals/kelly_sizing.py)
+KELLY_HALF          = True  # use half-Kelly (recommended)
+KELLY_MIN_TRADES    = 10    # minimum trades before Kelly departs from default
+
+# Exit engine triggers (signals/kelly_sizing.py)
+EXIT_IV_CRUSH_PCT   = 0.30  # exit if IV rose 30% since entry
+EXIT_TRAIL_TRIGGER  = 0.50  # start trailing at +50% premium gain
+
+# ── ML Ensemble Signal (signals/ml_signal.py) ───────────────────
+ML_ENABLED          = True    # set False to disable ML factor entirely
+ML_RETRAIN_CYCLES   = 100     # retrain after this many live cycles
+ML_CONFIRM_THRESHOLD = 0.65   # probability above which → CONFIRM (+pts)
+ML_CONTRA_THRESHOLD  = 0.38   # probability below which → CONTRA  (-pts)
+
 # ── Demo / Display mode ──────────────────────────────────────────
 DEMO_MODE    = None         # None=auto | True=force demo | False=force live
 DISPLAY_MODE = "terminal"   # "terminal" | "tkinter"  (override with --gui flag)
